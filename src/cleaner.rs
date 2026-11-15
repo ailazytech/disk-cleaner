@@ -8,7 +8,6 @@
 //! - 遞迴途中遇到受保護的資料夾（例如 TEMP 底下剛好是 ProgramData）整個略過
 //! - 雲端佔位檔（OneDrive）一律不刪；有其他硬連結的檔案不計入釋放空間
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -272,12 +271,15 @@ pub fn is_protected(path: &Path) -> bool {
     // 解析 junction、symlink、8.3 短檔名之後的實際位置也要檢查
     match win::final_path(path) {
         Some(real) => normalize(&real).is_none_or(|r| protected_norm(&r)),
+        // 壞掉的連結（目標不存在）：刪掉的只是連結本身，上面的字串檢查已經夠了
+        None if win::is_reparse(path) => false,
         // 不存在就沒有東西可刪；存在卻解析不了（權限、I/O 錯誤）就不冒險
         None => std::fs::symlink_metadata(path).is_ok(),
     }
 }
 
-/// 遞迴途中的子資料夾：路徑來自列舉結果（長檔名、上層都已握住不會變），只需比對字串。
+/// 遞迴途中的子資料夾。`path` 必須是「上層 handle 的實際路徑（[`win::Handle::real_path`]）＋列舉到的名稱」，
+/// 這樣才是長檔名、沒有 8.3 短檔名或連結別名，只需比對字串。
 fn protected_child(path: &Path) -> bool {
     normalize(path).is_none_or(|s| protected_norm(&s))
 }
@@ -303,7 +305,7 @@ impl DelProgress {
     }
 }
 
-/// 握住 dir 與它的所有上層。失敗時記錄原因；已經不存在就安靜地略過。
+/// 握住 dir 與它的所有上層（最後一個是 dir 本身）。失敗時記錄原因；已經不存在就安靜地略過。
 fn pin(dir: &Path, p: &DelProgress) -> Option<Vec<win::Handle>> {
     match win::pin_dir(dir) {
         Ok(v) => Some(v),
@@ -316,46 +318,27 @@ fn pin(dir: &Path, p: &DelProgress) -> Option<Vec<win::Handle>> {
     }
 }
 
-/// 打開要刪的項目。已經不存在回傳 None（不算失敗）；其他錯誤算失敗。
-fn open_for_delete(path: &Path, p: &DelProgress) -> Option<(win::Handle, win::HInfo)> {
-    match win::Handle::open(path, win::Open::Delete) {
-        Ok(h) => match h.info() {
-            Some(i) => Some((h, i)),
-            None => {
-                p.failed.fetch_add(1, Relaxed);
-                None
-            }
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => {
-            p.failed.fetch_add(1, Relaxed);
-            None
-        }
-    }
+fn not_found(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
 }
 
-/// 刪掉一個檔案（透過已確認過的 handle）。有其他硬連結時空間不會真的釋放，不計入。
+fn fail(p: &DelProgress, msg: String) {
+    p.log(msg);
+    p.failed.fetch_add(1, Relaxed);
+}
+
+/// 刪掉一個檔案（透過已確認過的 handle）。有其他硬連結時空間不會真的釋放，不計入；
+/// 稀疏、壓縮檔只算實際占用的大小。
 fn delete_handle_file(h: &win::Handle, i: &win::HInfo, p: &DelProgress) -> bool {
+    let real = h.allocated().map_or(i.size, |a| a.min(i.size));
     match h.delete() {
         Ok(()) => {
             if i.links <= 1 {
-                p.freed.fetch_add(i.size, Relaxed);
+                p.freed.fetch_add(real, Relaxed);
             }
             p.files.fetch_add(1, Relaxed);
             true
         }
-        Err(_) => {
-            p.failed.fetch_add(1, Relaxed);
-            false
-        }
-    }
-}
-
-/// 刪掉一個（應該已經清空的）資料夾。裡面還有刻意保留的項目時不算失敗。
-fn delete_handle_dir(h: &win::Handle, p: &DelProgress) -> bool {
-    match h.delete() {
-        Ok(()) => true,
-        Err(e) if e.raw_os_error() == Some(win::ERROR_DIR_NOT_EMPTY) => false,
         Err(_) => {
             p.failed.fetch_add(1, Relaxed);
             false
@@ -368,92 +351,185 @@ pub fn delete_children(dir: &Path, cut: u64, p: &DelProgress) {
     if p.cancel.load(Relaxed) {
         return;
     }
-    // 入口與所有上層都握住；任何一層是連結就拒絕（否則會清掉連結另一端的內容）
-    let Some(_pins) = pin(dir, p) else { return };
-    clean_dir(dir, cut, p);
+    if is_protected(dir) {
+        fail(p, format!("⛔ 受保護的位置，已略過：{}", dir.display()));
+        return;
+    }
+    // 從磁碟根目錄逐層以 handle 握住；任何一層是連結就拒絕（否則會清掉連結另一端的內容）
+    let Some(pins) = pin(dir, p) else { return };
+    let top = pins.last().expect("pin_dir 至少回傳一層");
+    let Some(real) = top.real_path() else {
+        fail(p, format!("⛔ 無法取得實際路徑，為了安全已略過：{}", dir.display()));
+        return;
+    };
+    if protected_child(&real) {
+        fail(p, format!("⛔ 受保護的位置，已略過：{}", real.display()));
+        return;
+    }
+    clean_dir(top, &real, cut, p);
 }
 
-/// dir 與它的所有上層都已經被握住（不會在途中被換掉）。
-fn clean_dir(dir: &Path, cut: u64, p: &DelProgress) {
+/// 清掉資料夾 handle `h` 裡 mtime <= cut 的項目。`dir` 是 h 的實際路徑（只用於保護檢查與紀錄）。
+/// 列舉與打開子項目都以 h 為基準，不經過路徑字串，所以 h 被改名或原地設成 junction 都沒有影響。
+/// 回傳「有沒有刻意保留或刪不掉的東西」：有的話，這個資料夾本身刪不掉是預期中的。
+fn clean_dir(h: &win::Handle, dir: &Path, cut: u64, p: &DelProgress) -> bool {
     if p.cancel.load(Relaxed) {
-        return;
+        return true;
     }
-    let mut ents: Vec<(OsString, u32, u64)> = Vec::new();
-    if win::list_dir(dir, |e| ents.push((e.name_os(), e.attrs, e.mtime))).is_err() {
-        p.failed.fetch_add(1, Relaxed);
-        return;
-    }
+    let ents = match h.list() {
+        Ok(v) => v,
+        Err(e) => {
+            fail(p, format!("⚠ 無法列出 {}：{e}", dir.display()));
+            return true;
+        }
+    };
     if let Some(mut g) = p.current.try_lock() {
         *g = dir.to_string_lossy().into_owned();
     }
-    ents.par_iter().for_each(|(name, attrs, mtime)| {
+    let kept = AtomicBool::new(false);
+    let keep = || kept.store(true, Relaxed);
+    ents.par_iter().for_each(|e| {
         if p.cancel.load(Relaxed) {
+            keep();
             return;
         }
         // 先用列舉結果過濾，省得打開不需要的項目（打開後還會從 handle 再確認一次）
-        if attrs & win::ATTR_CLOUD_MASK != 0 {
+        if e.attrs & win::ATTR_CLOUD_MASK != 0 {
+            keep();
             return;
         }
-        let is_dir = attrs & win::ATTR_DIRECTORY != 0 && attrs & win::ATTR_REPARSE == 0;
-        if !is_dir && *mtime > cut {
+        let is_dir = e.is_dir();
+        if !is_dir && e.mtime > cut {
+            keep();
             return;
         }
-        let path = dir.join(name);
+        let path = dir.join(&e.name);
         if is_dir && protected_child(&path) {
             p.log(format!("⛔ 受保護的位置，已略過：{}", path.display()));
+            keep();
             return;
         }
-        let Some((h, i)) = open_for_delete(&path, p) else { return };
+        let mode = if is_dir { win::Open::DeleteDir } else { win::Open::Delete };
+        let (child, can_delete) = match h.open_rel(&e.name, mode) {
+            Ok(c) => (c, true),
+            Err(err) if not_found(&err) => return,
+            // 資料夾本身不能刪，但裡面的東西可能可以：改用只列舉的方式進去清
+            Err(_) if is_dir => match h.open_rel(&e.name, win::Open::Pin) {
+                Ok(c) => (c, false),
+                Err(err) if not_found(&err) => return,
+                Err(_) => {
+                    p.failed.fetch_add(1, Relaxed);
+                    keep();
+                    return;
+                }
+            },
+            Err(_) => {
+                p.failed.fetch_add(1, Relaxed);
+                keep();
+                return;
+            }
+        };
+        let Some(i) = child.info() else {
+            p.failed.fetch_add(1, Relaxed);
+            keep();
+            return;
+        };
         if i.is_cloud() {
+            keep();
             return;
         }
         if i.is_reparse() {
             // 連結（或列舉之後才被換成連結）：只移除連結本身，不碰另一端
-            if i.mtime <= cut && h.delete().is_err() {
+            if i.mtime > cut {
+                keep();
+            } else if !can_delete || child.delete().is_err() {
                 p.failed.fetch_add(1, Relaxed);
+                keep();
             }
             return;
         }
-        if i.is_dir() {
-            if protected_child(&path) {
+        if i.is_dir() != is_dir {
+            // 列舉之後被換成另一種東西：不碰
+            keep();
+            return;
+        }
+        if is_dir {
+            // child 握在手上：遞迴期間這個資料夾不能被換掉
+            let inner_kept = clean_dir(&child, &path, cut, p);
+            if i.mtime > cut {
+                // 資料夾本身是最近才建立或變動的就保留（mtime 是刪內容之前取的）
+                keep();
                 return;
             }
-            // h 握在手上：遞迴期間這個資料夾不能被換掉
-            clean_dir(&path, cut, p);
-            // 資料夾本身是最近才建立或變動的就保留（mtime 是刪內容之前取的）
-            if i.mtime <= cut {
-                delete_handle_dir(&h, p);
+            if !can_delete {
+                p.failed.fetch_add(1, Relaxed);
+                keep();
+                return;
             }
-        } else if i.mtime <= cut {
-            delete_handle_file(&h, &i, p);
+            match child.delete() {
+                Ok(()) => {}
+                Err(err) if err.raw_os_error() == Some(win::ERROR_DIR_NOT_EMPTY) => {
+                    keep();
+                    if !inner_kept {
+                        // 裡面清完了卻還是不空：列舉之後又有東西放進來，算沒完成
+                        p.failed.fetch_add(1, Relaxed);
+                    }
+                }
+                Err(_) => {
+                    p.failed.fetch_add(1, Relaxed);
+                    keep();
+                }
+            }
+        } else if i.mtime > cut || !delete_handle_file(&child, &i, p) {
+            keep();
         }
     });
+    kept.load(Relaxed)
 }
 
 /// 刪除整個資料夾。資料夾本身是連結時只移除連結；路徑上層有連結則拒絕。
 pub fn delete_dir(dir: &Path, p: &DelProgress) -> bool {
     if is_protected(dir) {
-        p.log(format!("⛔ 受保護的位置，已略過：{}", dir.display()));
-        p.failed.fetch_add(1, Relaxed);
+        fail(p, format!("⛔ 受保護的位置，已略過：{}", dir.display()));
         return false;
     }
-    let Some(parent) = dir.parent() else { return false };
-    let Some(_pins) = pin(parent, p) else { return false };
-    let Some((h, i)) = open_for_delete(dir, p) else { return false };
-    if i.is_cloud() {
-        p.log(format!("☁ 雲端資料夾不刪（刪了會連雲端一起刪）：{}", dir.display()));
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else { return false };
+    let Some(pins) = pin(parent, p) else { return false };
+    let h = match pins.last().expect("pin_dir 至少回傳一層").open_rel(name, win::Open::DeleteDir) {
+        Ok(h) => h,
+        Err(e) if not_found(&e) => return false,
+        Err(e) => {
+            fail(p, format!("⚠ 無法刪除 {}：{e}", dir.display()));
+            return false;
+        }
+    };
+    let Some(i) = h.info() else {
         p.failed.fetch_add(1, Relaxed);
+        return false;
+    };
+    if i.is_cloud() {
+        fail(p, format!("☁ 雲端資料夾不刪（刪了會連雲端一起刪）：{}", dir.display()));
         return false;
     }
     if i.is_reparse() {
-        return delete_handle_dir(&h, p);
+        return h.delete().map_err(|_| p.failed.fetch_add(1, Relaxed)).is_ok();
     }
     if !i.is_dir() {
         return false;
     }
-    clean_dir(dir, u64::MAX, p);
+    let Some(real) = h.real_path() else {
+        fail(p, format!("⛔ 無法取得實際路徑，為了安全已略過：{}", dir.display()));
+        return false;
+    };
+    if protected_child(&real) {
+        fail(p, format!("⛔ 受保護的位置，已略過：{}", real.display()));
+        return false;
+    }
+    let kept = clean_dir(&h, &real, u64::MAX, p);
     match h.delete() {
         Ok(()) => true,
+        // 裡面刪不掉的已經算過失敗了，不重複計算
+        Err(e) if e.raw_os_error() == Some(win::ERROR_DIR_NOT_EMPTY) && kept => false,
         Err(_) => {
             p.failed.fetch_add(1, Relaxed);
             false
@@ -464,45 +540,112 @@ pub fn delete_dir(dir: &Path, p: &DelProgress) -> bool {
 /// 刪除單一檔案（只刪 mtime <= cut 的）。雲端佔位檔、受保護位置、經過連結的路徑都拒絕。
 pub fn delete_file(path: &Path, cut: u64, p: &DelProgress) -> bool {
     if is_protected(path) || path.parent().is_some_and(protected_subtree) {
-        p.log(format!("⛔ 受保護的位置，已略過：{}", path.display()));
-        p.failed.fetch_add(1, Relaxed);
+        fail(p, format!("⛔ 受保護的位置，已略過：{}", path.display()));
         return false;
     }
-    let Some(parent) = path.parent() else { return false };
-    let Some(_pins) = pin(parent, p) else { return false };
-    let Some((h, i)) = open_for_delete(path, p) else { return false };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    let Some(pins) = pin(parent, p) else { return false };
+    let h = match pins.last().expect("pin_dir 至少回傳一層").open_rel(name, win::Open::Delete) {
+        Ok(h) => h,
+        Err(e) if not_found(&e) => return false,
+        Err(_) => {
+            p.failed.fetch_add(1, Relaxed);
+            return false;
+        }
+    };
+    let Some(i) = h.info() else {
+        p.failed.fetch_add(1, Relaxed);
+        return false;
+    };
     if i.is_dir() && !i.is_reparse() {
         return false;
     }
     if i.is_cloud() {
-        p.log(format!("☁ 雲端佔位檔不刪（刪了會連雲端一起刪）：{}", path.display()));
-        p.failed.fetch_add(1, Relaxed);
+        fail(p, format!("☁ 雲端佔位檔不刪（刪了會連雲端一起刪）：{}", path.display()));
         return false;
     }
     if i.mtime > cut {
         return false;
     }
     if i.is_reparse() {
-        return h.delete().is_ok();
+        return h.delete().map_err(|_| p.failed.fetch_add(1, Relaxed)).is_ok();
     }
     delete_handle_file(&h, &i, p)
 }
 
-/// 刪除前共用的檢查（分析頁的「移到資源回收筒」也要走這裡）：受保護位置、路徑經過連結、雲端檔。
-/// 通過回傳 Ok，否則回傳要顯示的原因。
-pub fn precheck(path: &Path) -> Result<(), String> {
+/// 資料夾裡（不跟隨連結）有沒有雲端佔位檔。
+fn cloud_inside(h: &win::Handle) -> io::Result<bool> {
+    for e in h.list()? {
+        if e.attrs & win::ATTR_CLOUD_MASK != 0 {
+            return Ok(true);
+        }
+        if e.is_dir() {
+            let c = h.open_rel(&e.name, win::Open::Pin)?;
+            if c.info().is_some_and(|i| !i.is_reparse()) && cloud_inside(&c)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// 刪除前共用的檢查（分析頁的「移到資源回收筒」也要走這裡）：受保護位置、路徑經過連結、
+/// 雲端檔（資料夾會檢查裡面每一層）。通過時回傳握住的上層資料夾 handles：
+/// 呼叫端在實際刪除／回收完成前都要拿著，路徑才不會在途中被換掉。
+pub fn precheck(path: &Path) -> Result<Vec<win::Handle>, String> {
     if is_protected(path) || path.parent().is_some_and(protected_subtree) {
         return Err("這是受保護的位置，不能刪除".into());
     }
-    if path.parent().is_some_and(win::has_reparse_on_path) {
-        return Err("路徑經過連結（junction／symlink），為了安全不刪".into());
-    }
-    if let Some((attrs, _, _)) = win::stat(path)
-        && attrs & win::ATTR_CLOUD_MASK != 0
-    {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err("路徑格式不對".into());
+    };
+    let pins = win::pin_dir(parent).map_err(|e| format!("路徑經過連結（junction／symlink）或無法鎖定，為了安全不刪（{e}）"))?;
+    let ph = pins.last().expect("pin_dir 至少回傳一層");
+    let h = ph.open_rel(name, win::Open::Info).map_err(|e| e.to_string())?;
+    let i = h.info().ok_or("讀不到檔案資訊")?;
+    if i.is_cloud() {
         return Err("雲端佔位檔（OneDrive 等），刪了會連雲端一起刪".into());
     }
-    Ok(())
+    if i.is_dir() && !i.is_reparse() {
+        // 檢查完就放掉，不然自己握著的 handle 會擋住回收
+        let d = ph.open_rel(name, win::Open::Pin).map_err(|e| e.to_string())?;
+        match cloud_inside(&d) {
+            Ok(false) => {}
+            Ok(true) => return Err("資料夾裡有雲端佔位檔（OneDrive 等），整包刪掉會連雲端一起刪".into()),
+            Err(e) => return Err(format!("無法確認資料夾內容（{e}），為了安全不刪")),
+        }
+    }
+    Ok(pins)
+}
+
+/// 掃描（時間 t）之後有沒有變動：檔案看它自己的建立／修改／變更時間，
+/// 資料夾看裡面每一個檔案（資料夾本身的時間會因為刪掉旁邊的項目而改變，不算）。
+pub fn changed_since(path: &Path, t: u64) -> Result<bool, String> {
+    fn walk(h: &win::Handle, t: u64) -> io::Result<bool> {
+        for e in h.list()? {
+            if e.is_dir() {
+                let c = h.open_rel(&e.name, win::Open::Pin)?;
+                if c.info().is_some_and(|i| !i.is_reparse()) && walk(&c, t)? {
+                    return Ok(true);
+                }
+            } else if e.touched > t {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err("路徑格式不對".into());
+    };
+    let pins = win::pin_dir(parent).map_err(|e| e.to_string())?;
+    let ph = pins.last().expect("pin_dir 至少回傳一層");
+    let h = ph.open_rel(name, win::Open::Info).map_err(|e| e.to_string())?;
+    let i = h.info().ok_or("讀不到檔案資訊")?;
+    if i.is_dir() && !i.is_reparse() {
+        let d = ph.open_rel(name, win::Open::Pin).map_err(|e| e.to_string())?;
+        return walk(&d, t).map_err(|e| e.to_string());
+    }
+    Ok(h.touched().ok_or("讀不到檔案時間")? > t)
 }
 
 /// 父資料夾是否屬於「整個子樹都受保護」的區域（System32 等）。
@@ -534,7 +677,7 @@ fn total_free() -> u64 {
     let mut seen = std::collections::HashSet::new();
     win::drives()
         .iter()
-        .filter(|d| d.kind == "本機磁碟")
+        .filter(|d| d.kind == "本機磁碟" && !win::is_subst(&d.root))
         .filter(|d| seen.insert(win::volume_name(&d.root).unwrap_or_else(|| d.root.clone())))
         .map(|d| d.free)
         .sum()

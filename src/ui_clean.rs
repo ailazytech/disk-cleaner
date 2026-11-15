@@ -214,7 +214,7 @@ fn categories(app: &mut App, ui: &mut egui::Ui) {
         let mut idx: Vec<usize> = (0..app.clean.rows.len())
             .filter(|&i| {
                 let r = &app.clean.rows[i];
-                r.rule.cat == cat && (show_empty || r.bytes() > 0 || r.is_command() || r.measured.is_none())
+                r.rule.cat == cat && (show_empty || r.has_items() || r.is_command() || r.measured.is_none())
             })
             .collect();
         if idx.is_empty() {
@@ -251,11 +251,8 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
     let suggested = suggest::rule(&app.clean.rows[i], elevated);
     let row = &mut app.clean.rows[i];
     let locked = row.rule.admin && !elevated;
-    let bytes = row.bytes();
     let is_cmd = row.is_command();
-    // 資源回收筒裡只有空檔案／空資料夾時大小是 0，但還是可以清
-    let recycle_items = matches!(row.rule.action, crate::rules::Action::RecycleBin) && row.measured.as_ref().is_some_and(|m| m.files > 0);
-    let can = !locked && (bytes > 0 || is_cmd || recycle_items) && row.measured.is_some();
+    let can = !locked && (row.has_items() || is_cmd) && row.measured.is_some();
     let why = row.rule.why();
 
     // 右欄要顯示的東西先算好（左右兩個閉包不能同時借用 row）

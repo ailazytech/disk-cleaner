@@ -404,7 +404,12 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// 以 handle 為基礎的刪除：不跟隨連結；握住 handle 的期間，別人不能改名、刪除或替換它
+// 以 handle 為基礎的刪除
+//
+// 從磁碟根目錄開始，每一層都「以上一層的 handle 為基準」打開下一層（NtOpenFile + RootDirectory），
+// 列舉也直接對 handle 做（GetFileInformationByHandleEx），完全不再經過路徑字串。
+// 所以就算某個資料夾在途中被改名、被換掉，或空資料夾被原地設成 junction，
+// 我們看到、打開、刪除的都還是原本那個資料夾物件裡的東西。
 
 use windows_sys::Win32::Storage::FileSystem as fsys;
 
@@ -443,38 +448,79 @@ impl HInfo {
     }
 }
 
+/// handle 列舉出來的一筆
+#[derive(Clone, Debug)]
+pub struct DirEnt {
+    pub name: OsString,
+    pub attrs: u32,
+    pub mtime: u64,
+    /// 建立、修改、變更（含改名、屬性）時間中最新的一個
+    pub touched: u64,
+}
+
+impl DirEnt {
+    /// 一般資料夾（不是連結）
+    pub fn is_dir(&self) -> bool {
+        self.attrs & ATTR_DIRECTORY != 0 && self.attrs & ATTR_REPARSE == 0
+    }
+}
+
 pub const ERROR_DIR_NOT_EMPTY: i32 = 145;
+const ERROR_ACCESS_DENIED: i32 = 5;
 
 /// 打開 handle 的用途
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Open {
     /// 只讀屬性（不影響其他程式，也不擋任何操作）
     Info,
-    /// 握住資料夾：其他程式不能改名、刪除或替換它
+    /// 握住資料夾並可以列舉：其他程式不能改名、刪除或替換它。
+    /// 注意：只要求屬性存取權的 handle 不參與分享檢查，所以必須要求 FILE_LIST_DIRECTORY 才擋得住。
     Pin,
-    /// 之後要用 [`Handle::delete`] 刪掉它（同時也有 Pin 的效果）
+    /// 檔案：之後要用 [`Handle::delete`] 刪掉
     Delete,
+    /// 資料夾：可以列舉，之後要刪掉
+    DeleteDir,
+    /// 讀內容並鎖住（別人不能寫、不能刪、不能改名）：比對重複模型時保留的那份
+    ReadLocked,
+    /// 讀內容、鎖住，之後要刪掉：比對重複模型時要刪的那份
+    ReadDelete,
+}
+
+impl Open {
+    fn access(self) -> u32 {
+        let base = fsys::FILE_READ_ATTRIBUTES | fsys::SYNCHRONIZE;
+        base | match self {
+            Open::Info => 0,
+            Open::Pin => fsys::FILE_LIST_DIRECTORY,
+            Open::Delete => fsys::DELETE | fsys::FILE_WRITE_ATTRIBUTES,
+            Open::DeleteDir => fsys::DELETE | fsys::FILE_LIST_DIRECTORY | fsys::FILE_WRITE_ATTRIBUTES,
+            Open::ReadLocked => fsys::FILE_READ_DATA,
+            Open::ReadDelete => fsys::FILE_READ_DATA | fsys::DELETE,
+        }
+    }
+    fn share(self) -> u32 {
+        match self {
+            Open::ReadLocked | Open::ReadDelete => fsys::FILE_SHARE_READ,
+            _ => fsys::FILE_SHARE_READ | fsys::FILE_SHARE_WRITE,
+        }
+    }
+}
+
+fn nt_err(status: i32) -> io::Error {
+    let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+    io::Error::from_raw_os_error(code as i32)
 }
 
 impl Handle {
-    /// 不跟隨連結地打開檔案或資料夾（連結就打開連結本身）。
-    ///
-    /// 分享模式不含 DELETE。注意：只要求屬性存取權的 handle 不參與分享檢查，
-    /// 所以 Pin 必須要求 FILE_LIST_DIRECTORY，「不讓別人刪除／改名」才會生效。
+    /// 用路徑打開（不跟隨連結，連結就打開連結本身）。只用在磁碟根目錄或不需要防競態的地方，
+    /// 其他一律用 [`pin_dir`] + [`Handle::open_rel`]。
     pub fn open(path: &Path, mode: Open) -> io::Result<Handle> {
         let p = long_path(path);
-        let access = fsys::FILE_READ_ATTRIBUTES
-            | fsys::SYNCHRONIZE
-            | match mode {
-                Open::Info => 0,
-                Open::Pin => fsys::FILE_LIST_DIRECTORY,
-                Open::Delete => fsys::DELETE | fsys::FILE_WRITE_ATTRIBUTES,
-            };
         let h = unsafe {
             fsys::CreateFileW(
                 p.as_ptr(),
-                access,
-                fsys::FILE_SHARE_READ | fsys::FILE_SHARE_WRITE,
+                mode.access(),
+                mode.share(),
                 std::ptr::null(),
                 fsys::OPEN_EXISTING,
                 fsys::FILE_FLAG_BACKUP_SEMANTICS | fsys::FILE_FLAG_OPEN_REPARSE_POINT,
@@ -482,6 +528,46 @@ impl Handle {
             )
         };
         if h == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) } else { Ok(Handle(h)) }
+    }
+
+    /// 以這個資料夾 handle 為基準，打開裡面名為 `name` 的項目（不跟隨連結）。
+    /// 不經過路徑字串：這個資料夾就算被改名或原地設成 junction，打開的仍是它裡面的項目。
+    pub fn open_rel(&self, name: &OsStr, mode: Open) -> io::Result<Handle> {
+        match self.open_rel_access(name, mode, mode.access()) {
+            // 改屬性的權限只有舊版 Windows 的備用刪除路徑才需要；被拒絕就不要求
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) && matches!(mode, Open::Delete | Open::DeleteDir) => {
+                self.open_rel_access(name, mode, mode.access() & !fsys::FILE_WRITE_ATTRIBUTES)
+            }
+            r => r,
+        }
+    }
+
+    fn open_rel_access(&self, name: &OsStr, mode: Open, access: u32) -> io::Result<Handle> {
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::NtOpenFile;
+        use windows_sys::Win32::Foundation::UNICODE_STRING;
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let mut w: Vec<u16> = name.encode_wide().collect();
+        // 只接受單一層名稱
+        let bad = w.is_empty() || w.len() > 32000 || w.iter().any(|&c| c == b'\\' as u16 || c == b'/' as u16) || name == "." || name == "..";
+        if bad {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "不是單一層的名稱"));
+        }
+        let us = UNICODE_STRING { Length: (w.len() * 2) as u16, MaximumLength: (w.len() * 2) as u16, Buffer: w.as_mut_ptr() };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: self.0,
+            ObjectName: &us,
+            Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut h: HANDLE = std::ptr::null_mut();
+        // FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT
+        let opts = 0x0020_0000 | 0x0000_4000 | 0x0000_0020;
+        let st = unsafe { NtOpenFile(&mut h, access, &oa, &mut iosb, mode.share(), opts) };
+        if st < 0 { Err(nt_err(st)) } else { Ok(Handle(h)) }
     }
 
     pub fn info(&self) -> Option<HInfo> {
@@ -499,6 +585,89 @@ impl Handle {
         })
     }
 
+    /// 實際占用的大小（稀疏、壓縮檔會比邏輯大小小）。
+    pub fn allocated(&self) -> Option<u64> {
+        let mut s: fsys::FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<fsys::FILE_STANDARD_INFO>() as u32;
+        let ok = unsafe { fsys::GetFileInformationByHandleEx(self.0, fsys::FileStandardInfo, &mut s as *mut _ as *mut _, sz) };
+        (ok != 0).then_some(s.AllocationSize.max(0) as u64)
+    }
+
+    /// 建立、修改、變更（含改名、屬性）時間中最新的一個。
+    pub fn touched(&self) -> Option<u64> {
+        let mut b: fsys::FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<fsys::FILE_BASIC_INFO>() as u32;
+        let ok = unsafe { fsys::GetFileInformationByHandleEx(self.0, fsys::FileBasicInfo, &mut b as *mut _ as *mut _, sz) };
+        (ok != 0).then(|| b.CreationTime.max(b.LastWriteTime).max(b.ChangeTime).max(0) as u64)
+    }
+
+    /// 這個 handle 實際指向的完整路徑（長檔名，不含 8.3 短檔名、不含 `\\?\`）。
+    pub fn real_path(&self) -> Option<PathBuf> {
+        let mut buf = vec![0u16; 1024];
+        loop {
+            let n = unsafe { fsys::GetFinalPathNameByHandleW(self.0, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+            if n == 0 {
+                return None;
+            }
+            if n < buf.len() {
+                let s = String::from_utf16_lossy(&buf[..n]);
+                if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                    return Some(PathBuf::from(format!(r"\\{rest}")));
+                }
+                return Some(PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)));
+            }
+            buf.resize(n + 1, 0);
+        }
+    }
+
+    /// 直接對資料夾 handle 列舉內容（不經過路徑）。handle 需要 FILE_LIST_DIRECTORY（Pin／DeleteDir）。
+    pub fn list(&self) -> io::Result<Vec<DirEnt>> {
+        const NO_MORE_FILES: i32 = 18;
+        let mut out = Vec::new();
+        let mut buf = vec![0u64; 64 * 1024 / 8]; // 8 位元組對齊
+        let mut class = fsys::FileFullDirectoryRestartInfo;
+        loop {
+            let ok = unsafe { fsys::GetFileInformationByHandleEx(self.0, class, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32) };
+            if ok == 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(NO_MORE_FILES) {
+                    return Ok(out);
+                }
+                return Err(e);
+            }
+            class = fsys::FileFullDirectoryInfo;
+            let base = buf.as_ptr() as *const u8;
+            let mut off = 0usize;
+            loop {
+                // SAFETY: 系統填好的連續 FILE_FULL_DIR_INFO，NextEntryOffset 指向下一筆
+                let e = unsafe { &*(base.add(off) as *const fsys::FILE_FULL_DIR_INFO) };
+                let n = e.FileNameLength as usize / 2;
+                let name = unsafe { std::slice::from_raw_parts(e.FileName.as_ptr(), n) };
+                let dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
+                if !dot {
+                    out.push(DirEnt {
+                        name: OsString::from_wide(name),
+                        attrs: e.FileAttributes,
+                        mtime: e.LastWriteTime.max(0) as u64,
+                        touched: e.CreationTime.max(e.LastWriteTime).max(e.ChangeTime).max(0) as u64,
+                    });
+                }
+                if e.NextEntryOffset == 0 {
+                    break;
+                }
+                off += e.NextEntryOffset as usize;
+            }
+        }
+    }
+
+    /// 讀內容（handle 需要 FILE_READ_DATA）。
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0u32;
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        let ok = unsafe { fsys::ReadFile(self.0, buf.as_mut_ptr(), len, &mut n, std::ptr::null_mut()) };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+
     fn clear_readonly(&self) -> bool {
         let mut b: fsys::FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
         let sz = std::mem::size_of::<fsys::FILE_BASIC_INFO>() as u32;
@@ -506,7 +675,7 @@ impl Handle {
             return false;
         }
         if b.FileAttributes & ATTR_READONLY == 0 {
-            return true;
+            return false;
         }
         b.FileAttributes &= !ATTR_READONLY;
         if b.FileAttributes == 0 {
@@ -539,49 +708,101 @@ impl Handle {
             return Ok(());
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(ERROR_DIR_NOT_EMPTY) {
+        // 只有「不支援 Ex」（舊版 Windows、FAT32／exFAT、網路磁碟）才改用舊方法；
+        // 權限不足、使用中之類的錯誤直接回報，不要先動到唯讀屬性
+        const UNSUPPORTED: [i32; 4] = [1, 50, 87, 124]; // INVALID_FUNCTION、NOT_SUPPORTED、INVALID_PARAMETER、INVALID_LEVEL
+        if !err.raw_os_error().is_some_and(|c| UNSUPPORTED.contains(&c)) {
             return Err(err);
         }
-        // 舊版 Windows 或非 NTFS 不支援 Ex：清掉唯讀後用一般的刪除旗標
-        self.clear_readonly();
         let d = fsys::FILE_DISPOSITION_INFO { DeleteFile: true };
-        let ok = unsafe {
+        let set = |h: HANDLE| unsafe {
             fsys::SetFileInformationByHandle(
-                self.0,
+                h,
                 fsys::FileDispositionInfo,
                 &d as *const _ as *const _,
                 std::mem::size_of::<fsys::FILE_DISPOSITION_INFO>() as u32,
-            )
+            ) != 0
         };
-        if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        if set(self.0) {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // 舊方法遇到唯讀檔會被拒絕：這時才清掉唯讀再試一次
+        if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) && self.clear_readonly() && set(self.0) {
+            return Ok(());
+        }
+        Err(err)
     }
 }
 
-/// 從磁碟根目錄下一層開始，逐層不跟隨連結地打開並握住 `dir` 與它的所有上層，
-/// 確認每一層都是真的資料夾、不是連結。回傳的 handles drop 之前，這些資料夾都不能被改名或替換。
+/// 從磁碟根目錄開始，逐層「以上一層 handle 為基準」不跟隨連結地打開並握住 `dir` 與它的所有上層，
+/// 確認每一層都是真的資料夾、不是連結。回傳的最後一個就是 `dir` 本身（Pin，可列舉）。
+/// 這些 handles drop 之前，這些資料夾都不能被改名或替換。磁碟根目錄本身不接受。
 pub fn pin_dir(dir: &Path) -> io::Result<Vec<Handle>> {
-    let mut chain: Vec<&Path> = dir.ancestors().filter(|p| p.parent().is_some()).collect();
-    chain.reverse();
-    let mut out = Vec::with_capacity(chain.len());
-    for p in chain {
-        let h = Handle::open(p, Open::Pin)?;
+    use std::path::{Component, Prefix};
+    let mut comps = dir.components();
+    let root = match (comps.next(), comps.next()) {
+        (Some(Component::Prefix(p)), Some(Component::RootDir)) => match p.kind() {
+            Prefix::Disk(l) | Prefix::VerbatimDisk(l) => format!("{}:\\", l as char),
+            _ => return Err(io::Error::other("只支援本機磁碟路徑")),
+        },
+        _ => return Err(io::Error::other("必須是完整路徑")),
+    };
+    let names: Vec<&OsStr> = comps
+        .map(|c| match c {
+            Component::Normal(n) => Ok(n),
+            _ => Err(io::Error::other("路徑裡不能有 . 或 ..")),
+        })
+        .collect::<io::Result<_>>()?;
+    if names.is_empty() {
+        return Err(io::Error::other("不能是磁碟根目錄"));
+    }
+    let mut out: Vec<Handle> = Vec::with_capacity(names.len() + 1);
+    out.push(Handle::open(Path::new(&root), Open::Pin)?);
+    for n in names {
+        let h = out.last().unwrap().open_rel(n, Open::Pin)?;
         let i = h.info().ok_or_else(io::Error::last_os_error)?;
         if i.is_reparse() {
-            return Err(io::Error::other(format!("路徑經過連結：{}", p.display())));
+            return Err(io::Error::other(format!("路徑經過連結：{}", n.to_string_lossy())));
         }
         if !i.is_dir() {
-            return Err(io::Error::other(format!("不是資料夾：{}", p.display())));
+            return Err(io::Error::other(format!("不是資料夾：{}", n.to_string_lossy())));
         }
         out.push(h);
     }
     Ok(out)
 }
 
-/// 檔案的實體身分（磁碟區序號、檔案編號）。同一個檔案用不同路徑（大小寫、硬連結）也會相同。
-pub fn file_id(path: &Path) -> Option<(u32, u64)> {
-    let h = Handle::open(path, Open::Info).ok()?;
-    h.info().map(|i| (i.volume, i.index))
+/// 目前有沒有在執行這些程式（不分大小寫的執行檔名稱）。
+pub fn process_running(names: &[&str]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp as th;
+    let snap = unsafe { th::CreateToolhelp32Snapshot(th::TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let _guard = Handle(snap);
+    let mut e: th::PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    e.dwSize = std::mem::size_of::<th::PROCESSENTRY32W>() as u32;
+    let mut ok = unsafe { th::Process32FirstW(snap, &mut e) } != 0;
+    while ok {
+        let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+        let exe = String::from_utf16_lossy(&e.szExeFile[..n]).to_lowercase();
+        if names.iter().any(|x| exe == x.to_lowercase()) {
+            return true;
+        }
+        ok = unsafe { th::Process32NextW(snap, &mut e) } != 0;
+    }
+    false
 }
+
+/// 這個磁碟代號是不是 SUBST 出來的（指向某個資料夾，不是獨立的磁碟區）。
+pub fn is_subst(root: &str) -> bool {
+    let dev = wide(root.trim_end_matches('\\'));
+    let mut buf = [0u16; 512];
+    let n = unsafe { fsys::QueryDosDeviceW(dev.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    n > 0 && String::from_utf16_lossy(&buf[..n.min(buf.len())]).starts_with(r"\??\")
+}
+
 
 /// 磁碟區的唯一名稱（\?\Volume{GUID}\），同一個磁碟區有多個代號時用來去重。
 pub fn volume_name(root: &str) -> Option<String> {

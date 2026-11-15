@@ -416,16 +416,23 @@ pub fn catalog() -> Vec<Rule> {
 // 路徑展開
 
 /// 讀環境變數：空字串、相對路徑、網路路徑一律不用；`/` 換成 ``。
-/// %APPDATA% 底下看得出是 Chromium／Electron 應用程式的資料夾（裡面有 Chromium 的 Preferences 檔）。
+/// %APPDATA% 底下看得出是 Chromium／Electron 應用程式的資料夾：
+/// 有 Chromium 的 Preferences 設定檔（JSON），而且有 Chromium 的 Local Storage 資料夾。
 fn chromium_apps() -> Vec<String> {
     let Some(base) = env("APPDATA") else { return Vec::new() };
     let base = PathBuf::from(base);
+    let is_chromium = |dir: &std::path::Path| {
+        use std::io::Read;
+        let mut head = [0u8; 1];
+        let json = std::fs::File::open(dir.join("Preferences")).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head[0] == b'{';
+        json && dir.join("Local Storage").is_dir()
+    };
     let mut out = Vec::new();
     let _ = win::list_dir(&base, |e| {
         if e.is_dir() && !e.is_reparse() {
             let name = e.name_os().to_string_lossy().into_owned();
             // 名稱裡有樣板用的符號就跳過（不能被當成 token 或萬用字元）
-            if !name.contains(['{', '}', '*', '?']) && base.join(&name).join("Preferences").is_file() {
+            if !name.contains(['{', '}', '*', '?']) && is_chromium(&base.join(&name)) {
                 out.push(name);
             }
         }

@@ -80,6 +80,11 @@ impl RuleRow {
     pub fn is_command(&self) -> bool {
         matches!(self.rule.action, rules::Action::Command { .. })
     }
+    /// 有東西可清：大小 > 0，或資源回收筒裡有項目（只有空檔案／空資料夾時大小是 0，但還是可以清）
+    pub fn has_items(&self) -> bool {
+        self.bytes() > 0
+            || (matches!(self.rule.action, rules::Action::RecycleBin) && self.measured.as_ref().is_some_and(|m| m.files > 0))
+    }
 }
 
 pub struct MeasureJob {
@@ -153,6 +158,8 @@ pub struct ScanJob {
 
 pub struct Loaded {
     pub tree: Tree,
+    /// 這次掃描開始的時間（FILETIME）。刪除前用來判斷掃描之後有沒有變動
+    pub scanned_at: u64,
     pub origin: Origin,
     pub secs: f32,
     pub target: PathBuf,
@@ -180,6 +187,7 @@ pub struct DelRequest {
     pub node: u32,
     pub path: PathBuf,
     pub size: u64,
+    pub scanned_at: u64,
     pub permanent: bool,
 }
 
@@ -385,12 +393,11 @@ impl App {
             let elevated = self.elevated;
             let row = &mut self.clean.rows[i];
             let first = row.measured.is_none();
-            let has = m.bytes > 0 || (matches!(row.rule.action, rules::Action::RecycleBin) && m.files > 0);
             row.measured = Some(m);
             if first {
                 row.checked = default_checked(row, elevated);
             }
-            if !has && !matches!(row.rule.action, rules::Action::Command { .. }) {
+            if !row.has_items() && !matches!(row.rule.action, rules::Action::Command { .. }) {
                 row.checked = false;
             }
         }
@@ -603,6 +610,15 @@ impl App {
                 // 掃描之後又有新的檔案（例如剛重新 build 過）：勾選時看到的「多久沒動」已經不對了
                 *prog.current.lock() = format!("確認 {} 沒有變動…", a.0.display());
                 let now = crate::scan::dir_size(&a.0, u64::MAX, &prog.cancel);
+                if prog.cancel.load(Relaxed) {
+                    break;
+                }
+                if now.errors > 0 {
+                    prog.log(format!("⚠ {}：有 {} 個資料夾讀不到，無法確認有沒有變動，已略過", a.0.display(), now.errors));
+                    prog.failed.fetch_add(1, Relaxed);
+                    prog.step.fetch_add(1, Relaxed);
+                    continue;
+                }
                 if now.newest > a.2 {
                     prog.log(format!("⚠ {}：掃描之後有新的變動（{}），已略過；請重新搜尋再決定", a.0.display(), fmt::ago(now.newest)));
                     prog.failed.fetch_add(1, Relaxed);
@@ -626,32 +642,43 @@ impl App {
                     break;
                 }
                 *prog.current.lock() = m.name.clone();
-                let verdict = match check {
-                    DupCheck::None => Ok(()),
-                    DupCheck::Stale => Err("已經不算重複了（保留的那份不在清單裡）".to_string()),
-                    DupCheck::Keep(keep) => {
-                        *prog.current.lock() = format!("比對 {} 與保留的那份…", m.name);
-                        crate::models::verify_duplicate(&m.path, keep, &prog.cancel)
-                    }
-                };
-                if let Err(why) = verdict {
-                    prog.log(format!("⚠ 模型 {}：{why}，已略過", m.name));
-                    prog.failed.fetch_add(1, Relaxed);
-                    prog.step.fetch_add(1, Relaxed);
-                    ctx.request_repaint();
-                    continue;
-                }
                 let before = prog.freed.load(Relaxed);
-                let ok = match m.del {
-                    crate::models::ModelDel::Dir => cleaner::delete_dir(&m.path, &prog),
-                    crate::models::ModelDel::File => cleaner::delete_file(&m.path, u64::MAX, &prog),
-                    crate::models::ModelDel::Ollama => match crate::models::delete_ollama(&m.path) {
-                        Ok(freed) => {
+                let ok = match (check, &m.del) {
+                    (DupCheck::Stale, _) => {
+                        prog.log(format!("⚠ 模型 {}：已經不算重複了（保留的那份不在清單裡），已略過", m.name));
+                        prog.failed.fetch_add(1, Relaxed);
+                        false
+                    }
+                    // 因為「重複」才勾的：比對與刪除用同一組 handle，保留的那份全程鎖住
+                    (DupCheck::Keep(keep), _) => {
+                        *prog.current.lock() = format!("比對 {} 與保留的那份…", m.name);
+                        match crate::models::delete_duplicate(&m.path, keep, &prog.cancel) {
+                            Ok(freed) => {
+                                prog.freed.fetch_add(freed, Relaxed);
+                                prog.files.fetch_add(1, Relaxed);
+                                true
+                            }
+                            Err(why) => {
+                                prog.log(format!("⚠ 模型 {}：{why}，已略過", m.name));
+                                prog.failed.fetch_add(1, Relaxed);
+                                false
+                            }
+                        }
+                    }
+                    (DupCheck::None, crate::models::ModelDel::Dir) => cleaner::delete_dir(&m.path, &prog),
+                    (DupCheck::None, crate::models::ModelDel::File) => cleaner::delete_file(&m.path, u64::MAX, &prog),
+                    (DupCheck::None, crate::models::ModelDel::Ollama) => match crate::models::delete_ollama(&m.path, true) {
+                        Ok((freed, failed)) => {
                             prog.freed.fetch_add(freed, Relaxed);
-                            true
+                            if failed > 0 {
+                                prog.log(format!("   ⚠ 有 {failed} 個模型檔刪不掉（可能使用中）"));
+                                prog.failed.fetch_add(failed, Relaxed);
+                            }
+                            failed == 0
                         }
                         Err(e) => {
                             prog.log(format!("   ⚠ {e}"));
+                            prog.failed.fetch_add(1, Relaxed);
                             false
                         }
                     },
@@ -711,6 +738,7 @@ impl App {
     fn poll_scan(&mut self) {
         let Some(job) = &self.an.job else { return };
         let Ok(res) = job.rx.try_recv() else { return };
+        let scanned_at = win::now_filetime().saturating_sub(job.started.elapsed().as_nanos() as u64 / 100);
         self.an.job = None;
         match res {
             Ok(out) => {
@@ -729,7 +757,7 @@ impl App {
                 self.an.layout = None;
                 self.an.stats = None;
                 self.an.kind_focus = None;
-                self.an.data = Some(Loaded { tree: out.tree, origin: out.origin, secs: out.secs, target: out.target, base: out.view, rev });
+                self.an.data = Some(Loaded { tree: out.tree, scanned_at, origin: out.origin, secs: out.secs, target: out.target, base: out.view, rev });
                 if let Some(k) = self.dash.pending_focus.take() {
                     self.an.kind_focus = Some(k);
                     self.an.side = Side::Types;
@@ -851,23 +879,40 @@ impl App {
             com_init();
             let meta = win::stat(&req.path);
             let is_dir = meta.is_some_and(|m| m.0 & win::ATTR_DIRECTORY != 0);
-            // 檔案在掃描之後被換掉（大小不同）就不刪，請使用者重新掃描
-            if !is_dir && meta.is_some_and(|m| m.1 != req.size && m.0 & win::ATTR_REPARSE == 0) {
-                prog.log("檔案在掃描之後有變動，請重新掃描再刪除");
+            // 掃描之後被換掉或有新東西（大小不同、建立／修改／改名時間比掃描晚）就不刪，請使用者重新掃描。
+            // 同大小的新檔案光比大小看不出來，所以也比時間；資料夾會檢查裡面每一個檔案。
+            let changed = match cleaner::changed_since(&req.path, req.scanned_at) {
+                Ok(c) => c,
+                Err(_) => meta.is_some(), // 還在卻讀不到時間：不冒險
+            };
+            if !is_dir && meta.is_some_and(|m| m.1 != req.size && m.0 & win::ATTR_REPARSE == 0) || changed {
+                prog.log("掃描之後有變動，請重新掃描再刪除");
                 prog.failed.fetch_add(1, Relaxed);
-            } else if let Err(why) = cleaner::precheck(&req.path) {
-                // 永久刪除與移到資源回收筒共用：受保護位置、路徑經過連結、雲端檔
-                prog.log(why);
-                prog.failed.fetch_add(1, Relaxed);
-            } else if req.permanent {
-                if is_dir {
-                    cleaner::delete_dir(&req.path, &prog);
-                } else {
-                    cleaner::delete_file(&req.path, u64::MAX, &prog);
+            } else {
+                // 永久刪除與移到資源回收筒共用：受保護位置、路徑經過連結、雲端檔（資料夾含裡面每一層）。
+                // 回傳的 pins 握住上層資料夾，回收完成前路徑不會被換掉
+                match cleaner::precheck(&req.path) {
+                    Err(why) => {
+                        prog.log(why);
+                        prog.failed.fetch_add(1, Relaxed);
+                    }
+                    Ok(pins) => {
+                        if req.permanent {
+                            drop(pins); // 永久刪除自己會從頭握住每一層
+                            if is_dir {
+                                cleaner::delete_dir(&req.path, &prog);
+                            } else {
+                                cleaner::delete_file(&req.path, u64::MAX, &prog);
+                            }
+                        } else {
+                            if !win::move_to_recycle_bin(std::slice::from_ref(&req.path)) {
+                                prog.log("無法移到資源回收筒（路徑太長、檔案使用中，或取消了操作）");
+                                prog.failed.fetch_add(1, Relaxed);
+                            }
+                            drop(pins);
+                        }
+                    }
                 }
-            } else if !win::move_to_recycle_bin(std::slice::from_ref(&req.path)) {
-                prog.log("無法移到資源回收筒（路徑太長、檔案使用中，或取消了操作）");
-                prog.failed.fetch_add(1, Relaxed);
             }
             done.store(true, Relaxed);
             ctx.request_repaint();

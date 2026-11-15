@@ -379,7 +379,7 @@ fn apply(st: &mut AnalyzeState, data: &Loaded, ctx: &egui::Context, a: Act) {
                 // 快取的舊資料：檔案可能已經換過，不能直接拿來刪
                 st.message = Some("目前顯示的是快取的舊資料，請先按「重新掃描」再刪除。".into());
             } else if n != 0 {
-                st.del = Some(DelRequest { node: n, path: t.path(n), size: t.nodes[n as usize].size, permanent });
+                st.del = Some(DelRequest { node: n, path: t.path(n), size: t.nodes[n as usize].size, scanned_at: data.scanned_at, permanent });
             }
         }
         Act::Focus(k) => st.kind_focus = k,

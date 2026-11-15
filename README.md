@@ -81,18 +81,18 @@ On the author's machine a full walk without administrator rights runs at about 1
 Wrongly deleting your data is the worst thing a cleaner can do, so the deletion code is written to fail closed:
 
 - Never follows junctions or symlinks: if a target — or any folder on its path — is a link, it is skipped; links found inside are removed as links only
-- Deletion works through handles, not paths: every folder from the drive root down to the item is opened without following links and held open (so nothing can rename it or swap it for a junction mid-delete), and each item is checked and deleted through that same handle
+- Deletion never goes through path strings: starting at the drive root, each folder is opened relative to the handle of its parent (without following links) and held open, folders are listed through their handles, and each item is checked and deleted through its own handle. A folder that gets renamed, swapped, or turned into a junction in place mid-delete still only exposes its original contents
 - Protected paths are checked after normalizing the path (`/`, `..`, trailing separators, drive-relative paths) **and** after resolving links and 8.3 short names: drive roots, every user profile under `Users`, Documents / Desktop / Downloads (even if moved to another drive), Windows and its system folders (System32, WinSxS…), Program Files, ProgramData, the AppData roots, `$Recycle.Bin`, `System Volume Information`
 - Results shown from the cache are never used to delete: each rule is measured again right before cleaning, and each build artifact is re-detected and skipped if anything in it changed since the scan
 - A folder that contains `.git` / `.hg` / `.svn`, or a project file such as `Cargo.toml` / `CMakeLists.txt`, is never treated as a build artifact; `CACHEDIR.TAG` must carry the real signature; a venv is recognised as a venv whatever it is called
-- Duplicate models are compared byte for byte against the copy being kept (and must be two different files) before one is deleted
-- Ollama: manifest digests must look like `sha256:<hex>`, blobs are only removed from the `blobs` folder, and nothing is removed unless every other manifest can be listed, read and parsed completely
+- Duplicate models are compared byte for byte against the copy being kept, through locked handles that are also used for the delete; both must be regular, different files
+- Ollama: models are only removed while Ollama is not running; manifest digests must look like `sha256:<hex>`, blobs are only removed from the `blobs` folder, and nothing is removed unless every other manifest can be listed, read and fully understood
 - Files in use are skipped; cloud placeholders (OneDrive) are never deleted; with an age limit, recently created folders are kept; files with other hard links don't count as freed space
-- **Move to Recycle Bin** goes through the same checks as permanent delete and asks before permanently deleting something that can't be recycled; the analyzer refuses to delete from stale cached data until you rescan
+- **Move to Recycle Bin** goes through the same checks as permanent delete (including cloud files anywhere inside a folder) and asks before permanently deleting something that can't be recycled; the analyzer refuses to delete stale cached data, or anything created or modified after the scan, until you rescan
 - Clean rules delete permanently (that is how space gets freed)
-- `disk-cleaner.exe --selftest` runs 63 checks in a scratch folder (junctions, folders held open against renaming, hard links, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
+- `disk-cleaner.exe --selftest` runs 76 checks in a scratch folder (junctions, a folder turned into a junction in place mid-clean, folders held open against renaming, 8.3 short names, hard links, simulated cloud files, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
 
-The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes were reviewed again in a second round; the issues found are fixed and covered by the self-test.
+The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes went through two more review rounds; the issues found are fixed and covered by the self-test.
 
 ## Build
 

@@ -227,8 +227,8 @@ fn selftest() -> bool {
     found.sort_by(|a, b| a.name.cmp(&b.name));
     check("讀出 Ollama 模型名稱", found.iter().map(|m| m.name.as_str()).collect::<Vec<_>>() == ["alpha:7b", "beta:latest"]);
     check("Ollama 模型大小", found.first().is_some_and(|m| m.bytes == 11));
-    let freed = models::delete_ollama(&lib.join("alpha").join("7b"));
-    check("刪除 alpha 只釋放獨有的 blob", freed == Ok(5));
+    let freed = models::delete_ollama(&lib.join("alpha").join("7b"), false);
+    check("刪除 alpha 只釋放獨有的 blob", freed == Ok((5, 0)));
     check("共用 blob 保留", om.join("blobs").join("sha256-1111111111111111111111111111111111111111111111111111111111111111").exists() && om.join("blobs").join("sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").exists());
     check("獨有 blob 已刪", !om.join("blobs").join("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").exists() && !lib.join("alpha").join("7b").exists());
     check("模型副檔名判斷", models::is_model_file("x.SafeTensors") && models::is_model_file("a.gguf") && !models::is_model_file("a.bin"));
@@ -273,7 +273,7 @@ fn selftest() -> bool {
     w(&outside, "must stay");
     let evil = lib.join("evil").join("latest");
     w(&evil, "{\"layers\":[{\"digest\":\"..\\\\outside.bin\",\"size\":9}]}");
-    check("Ollama 惡意 digest 被拒絕", models::delete_ollama(&evil).is_err() && outside.exists() && evil.exists());
+    check("Ollama 惡意 digest 被拒絕", models::delete_ollama(&evil, false).is_err() && outside.exists() && evil.exists());
     check("digest 格式驗證", models::valid_digest(&format!("sha256:{}", "a".repeat(64))) && !models::valid_digest("sha256:../x"));
 
     // 7d. 偵測誤判
@@ -368,25 +368,144 @@ fn selftest() -> bool {
     w(&om.join("blobs").join(d_shared.replace(':', "-")), "shared");
     w(&om.join("blobs").join(d_own.replace(':', "-")), "gggg");
     w(&lib.join("half").join("latest"), "{\"layers\":[{\"digest\":\"sha256:");
-    check("其他 manifest 不完整時不刪", models::delete_ollama(&lib.join("gamma").join("1b")).is_err() && lib.join("gamma").join("1b").exists());
+    check("其他 manifest 不完整時不刪", models::delete_ollama(&lib.join("gamma").join("1b"), false).is_err() && lib.join("gamma").join("1b").exists());
     fs::remove_file(lib.join("half").join("latest")).unwrap();
     fs::remove_file(&evil).unwrap();
-    let freed = models::delete_ollama(&lib.join("gamma").join("1b"));
-    check("digest 大小寫不同仍視為共用", freed == Ok(4) && om.join("blobs").join(d_shared.replace(':', "-")).exists());
+    let freed = models::delete_ollama(&lib.join("gamma").join("1b"), false);
+    check("digest 大小寫不同仍視為共用", freed == Ok((4, 0)) && om.join("blobs").join(d_shared.replace(':', "-")).exists());
 
     // 10g. 重複模型：同名同大小但內容不同、或其實是同一個檔案，都不能刪
     let md = base.join("models");
     w(&md.join("a").join("model.safetensors"), "AAAAAAAA");
     w(&md.join("b").join("model.safetensors"), "AAAAAAAA");
     w(&md.join("c").join("model.safetensors"), "BBBBBBBB");
+    fs::create_dir_all(md.join("d")).unwrap();
+    fs::hard_link(md.join("b").join("model.safetensors"), md.join("d").join("model.safetensors")).unwrap();
     let cancel2 = AtomicBool::new(false);
-    check("內容相同才算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("b").join("model.safetensors"), &cancel2).is_ok());
-    check("同名同大小但內容不同不算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("c").join("model.safetensors"), &cancel2).is_err());
-    check("同一個檔案（大小寫不同）不算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("A").join("MODEL.safetensors"), &cancel2).is_err());
+    let (ma, mb, mc) = (md.join("a").join("model.safetensors"), md.join("b").join("model.safetensors"), md.join("c").join("model.safetensors"));
+    check("同名同大小但內容不同不刪", models::delete_duplicate(&ma, &mc, &cancel2).is_err() && ma.exists());
+    check("同一個檔案（大小寫不同）不刪", models::delete_duplicate(&ma, &md.join("A").join("MODEL.safetensors"), &cancel2).is_err() && ma.exists());
+    check("保留的那份是硬連結（同一個實體）不刪", models::delete_duplicate(&mb, &md.join("d").join("model.safetensors"), &cancel2).is_err() && mb.exists());
+    check("內容相同才刪，保留的那份還在", models::delete_duplicate(&ma, &mb, &cancel2).is_ok() && !ma.exists() && mb.exists());
+
+    // 11. 第三輪審查（Codex gpt-6.1-sol + Gemini Hydrogen）
+    // 11a. 空資料夾被「原地」設成 junction（不必改名，握住也擋不住）：路徑會跟著走，handle 不會
+    let victim = base.join("victim");
+    w(&victim.join("precious.txt"), "keep me");
+    let swap = base.join("swap").join("empty");
+    fs::create_dir_all(&swap).unwrap();
+    let swap_pins = win::pin_dir(&swap).unwrap();
+    let swapped = set_junction(&swap, &victim);
+    check("模擬攻擊：握住的空資料夾仍可被原地設成 junction", swapped);
+    let mut via_path = Vec::new();
+    let _ = win::list_dir(&swap, |e| via_path.push(e.name_os()));
+    check("用路徑列舉會跟著 junction 走（舊做法的漏洞）", via_path.iter().any(|n| n == "precious.txt"));
+    let sh = swap_pins.last().unwrap();
+    check("用 handle 列舉不會跟著 junction 走", sh.list().is_ok_and(|v| v.is_empty()));
+    check("以 handle 為基準打不開另一端的檔案", sh.open_rel(std::ffi::OsStr::new("precious.txt"), win::Open::Info).is_err());
+    drop(swap_pins);
+    check("junction 另一端完好", victim.join("precious.txt").exists());
+
+    // 11b. 8.3 短檔名：清理時用的是 handle 的實際長路徑（受保護資料夾比對才不會漏）
+    let longdir = base.join("Long Folder Name For Short");
+    fs::create_dir_all(&longdir).unwrap();
+    let short = short_path(&longdir).unwrap_or_else(|| longdir.clone());
+    let real = win::pin_dir(&short).ok().and_then(|v| v.last().and_then(|h| h.real_path()));
+    check("短檔名會換成實際長路徑", real.is_some_and(|r| r.to_string_lossy().to_lowercase() == longdir.to_string_lossy().to_lowercase()));
+    check("不接受磁碟根目錄", win::pin_dir(Path::new("C:\\")).is_err());
+
+    // 11c. 資料夾裡有雲端檔（以 OFFLINE 屬性模擬）：回收前要擋，清理時要略過
+    let cd = base.join("cloudy");
+    let cf = cd.join("sub").join("online.txt");
+    w(&cf, "x");
+    set_offline(&cf);
+    check("資料夾裡有雲端檔時拒絕回收", cleaner::precheck(&cd).is_err());
+    let dp8 = cleaner::DelProgress::default();
+    cleaner::delete_children(&cd, u64::MAX, &dp8);
+    check("清理時略過雲端檔", cf.exists());
+
+    // 11d. Ollama：其他 manifest 用 JSON 跳脫字元寫 digest 時不刪
+    let d_e = format!("sha256:{}", "e".repeat(64));
+    let d_f = format!("sha256:{}", "f".repeat(64));
+    w(&lib.join("epsilon").join("latest"), &man(&[(d_e.as_str(), 5), (d_f.as_str(), 5)]));
+    w(&om.join("blobs").join(d_e.replace(':', "-")), "eeeee");
+    w(&om.join("blobs").join(d_f.replace(':', "-")), "fffff");
+    let escaped = format!("{{\"layers\":[{{\"digest\":\"sha256:\\u0065{}\",\"size\":5}}]}}", "e".repeat(63));
+    w(&lib.join("escaped").join("latest"), &escaped);
+    check("其他 manifest 有跳脫字元時不刪", models::delete_ollama(&lib.join("epsilon").join("latest"), false).is_err() && om.join("blobs").join(d_e.replace(':', "-")).exists());
+
+    // 11e. 分析頁：掃描之後才出現的檔案要能發現（同大小的新檔案光比大小看不出來）
+    let cs = base.join("changed");
+    w(&cs.join("old.txt"), "old");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let t = win::now_filetime();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    check("掃描之前就有的檔案不算變動", cleaner::changed_since(&cs.join("old.txt"), t) == Ok(false) && cleaner::changed_since(&cs, t) == Ok(false));
+    w(&cs.join("sub").join("new.txt"), "new");
+    check("掃描之後新增的檔案會被發現", cleaner::changed_since(&cs, t) == Ok(true));
 
     let _ = fs::remove_dir_all(&base);
     println!("{}", if ok { "全部通過" } else { "有測試失敗" });
     ok
+}
+
+/// 自我測試用：把一個「已經存在的空資料夾」原地設成指向 target 的 junction（模擬攻擊）。
+/// 只要求 FILE_WRITE_ATTRIBUTES，示範這種權限不受分享模式限制。
+fn set_junction(dir: &std::path::Path, target: &std::path::Path) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem as fsys;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    let subst: Vec<u16> = format!(r"\??\{}", target.display()).encode_utf16().collect();
+    let print: Vec<u16> = target.display().to_string().encode_utf16().collect();
+    let mut names: Vec<u16> = subst.clone();
+    names.push(0);
+    names.extend(&print);
+    names.push(0);
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend(0xA000_0003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+    buf.extend(((8 + names.len() * 2) as u16).to_le_bytes());
+    buf.extend(0u16.to_le_bytes());
+    buf.extend(0u16.to_le_bytes());
+    buf.extend(((subst.len() * 2) as u16).to_le_bytes());
+    buf.extend((((subst.len() + 1) * 2) as u16).to_le_bytes());
+    buf.extend(((print.len() * 2) as u16).to_le_bytes());
+    for c in names {
+        buf.extend(c.to_le_bytes());
+    }
+    let p = win::long_path(dir);
+    unsafe {
+        let h = fsys::CreateFileW(
+            p.as_ptr(),
+            fsys::FILE_WRITE_ATTRIBUTES,
+            fsys::FILE_SHARE_READ | fsys::FILE_SHARE_WRITE | fsys::FILE_SHARE_DELETE,
+            std::ptr::null(),
+            fsys::OPEN_EXISTING,
+            fsys::FILE_FLAG_BACKUP_SEMANTICS | fsys::FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut ret = 0u32;
+        let ok = DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf.as_ptr() as *const _, buf.len() as u32, std::ptr::null_mut(), 0, &mut ret, std::ptr::null_mut());
+        CloseHandle(h);
+        ok != 0
+    }
+}
+
+/// 自我測試用：8.3 短檔名（磁碟關掉短檔名時回傳 None）。
+fn short_path(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    let w = win::wide(p);
+    let mut buf = [0u16; 1024];
+    let n = unsafe { windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+}
+
+/// 自我測試用：加上 OFFLINE 屬性，模擬雲端佔位檔。
+fn set_offline(p: &std::path::Path) {
+    let w = win::wide(p);
+    unsafe { windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(w.as_ptr(), win::ATTR_OFFLINE) };
 }
 
 fn icon() -> eframe::egui::IconData {

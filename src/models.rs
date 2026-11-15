@@ -308,10 +308,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
-/// 刪除 Ollama 模型：移除 manifest，再刪掉沒有其他 manifest 參照的 blob。回傳釋放的位元組數。
-/// 「其他模型用到哪些 blob」只要有一點不確定（資料夾列不出來、有連結、太深、manifest 讀不到或不完整），
-/// 就整個不刪。其他 manifest 裡任何長得像 digest 的字串都當成有參照。
-pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
+/// 刪除 Ollama 模型：移除 manifest，再刪掉沒有其他 manifest 參照的 blob。回傳（釋放的位元組數, 刪不掉的 blob 數）。
+/// 「其他模型用到哪些 blob」只要有一點不確定（Ollama 正在執行、資料夾列不出來、有連結、太深、
+/// manifest 讀不到、不完整或有跳脫字元），就整個不刪。其他 manifest 裡任何長得像 digest 的字串都當成有參照。
+/// `check_running`：Ollama 正在執行時拒絕（它隨時可能新增參照同一個 blob 的 manifest）；只有自我測試會關掉。
+pub fn delete_ollama(manifest: &Path, check_running: bool) -> Result<(u64, u64), String> {
+    if check_running && win::process_running(&["ollama.exe", "ollama app.exe"]) {
+        return Err("Ollama 正在執行，它可能隨時新增用到同一份檔案的模型；請先結束 Ollama（含系統匣圖示）再刪".into());
+    }
     let models = ollama_dir().ok_or("找不到 Ollama 模型資料夾")?;
     let blobs = models.join("blobs");
     let manifests = models.join("manifests");
@@ -319,12 +323,18 @@ pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
         .to_string_lossy()
         .to_lowercase()
         .starts_with(&format!("{}\\", manifests.to_string_lossy().to_lowercase()));
-    if !inside || win::has_reparse_on_path(manifest) || win::has_reparse_on_path(&blobs) {
-        return Err("manifest 不在 Ollama 模型資料夾裡，或路徑經過連結，已略過".into());
+    if !inside {
+        return Err("manifest 不在 Ollama 模型資料夾裡，已略過".into());
     }
+    let (Some(man_dir), Some(man_name)) = (manifest.parent(), manifest.file_name()) else {
+        return Err("manifest 路徑格式不對".into());
+    };
+    // 握住 manifest 所在資料夾與 blobs（含所有上層）：之後都以 handle 為基準打開、刪除，途中不能被換成連結
+    let man_pins = win::pin_dir(man_dir).map_err(|e| format!("manifest 資料夾經過連結或無法鎖定（{e}），為了安全不刪"))?;
+    let blob_pins = win::pin_dir(&blobs).map_err(|e| format!("blobs 資料夾經過連結或無法鎖定（{e}），為了安全不刪"))?;
     let text = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let mine: Vec<String> = manifest_layers(&text).into_iter().map(|x| x.0).collect();
-    if !json_complete(&text) || mine.is_empty() || mine.iter().any(|d| !valid_digest(d)) {
+    if !json_complete(&text) || text.contains('\\') || mine.is_empty() || mine.iter().any(|d| !valid_digest(d)) {
         return Err("manifest 內容格式不對，為了安全不刪".into());
     }
     let all = list_manifests(true).map_err(|e| format!("{e}，無法確認其他模型用到哪些檔案，為了安全不刪"))?;
@@ -339,35 +349,53 @@ pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
         if !json_complete(&t) {
             return Err(format!("其他模型的 manifest 不完整（{}），可能正在下載或寫入，為了安全不刪", p.display()));
         }
+        // JSON 跳脫字元（反斜線 u 加四位十六進位，代表一個普通字母）會讓 digest 比對漏掉，看不懂就不刪
+        if t.contains('\\') {
+            return Err(format!("其他模型的 manifest 有無法確認的寫法（{}），為了安全不刪", p.display()));
+        }
         others.extend(referenced_digests(&t));
     }
     if !found_self {
         return Err("在 Ollama 模型清單裡找不到這個 manifest，已略過".into());
     }
-    // 握住 blobs 與所有上層：刪除途中不能被換成連結
-    let _pins = win::pin_dir(&blobs).map_err(|e| format!("blobs 資料夾無法鎖定（{e}），為了安全不刪"))?;
-    std::fs::remove_file(manifest).map_err(|e| e.to_string())?;
-    let mut freed = 0;
+    let mh = man_pins.last().expect("pin_dir 至少回傳一層").open_rel(man_name, win::Open::Delete).map_err(|e| e.to_string())?;
+    let mi = mh.info().ok_or("讀不到 manifest 資訊")?;
+    if mi.is_dir() || mi.is_reparse() || mi.is_cloud() {
+        return Err("manifest 不是一般檔案，已略過".into());
+    }
+    mh.delete().map_err(|e| e.to_string())?;
+    let bh = blob_pins.last().expect("pin_dir 至少回傳一層");
+    let (mut freed, mut failed) = (0, 0);
     let mut done = HashSet::new();
     for d in mine {
         let d = d.to_ascii_lowercase();
-        if others.contains(&d) || !done.insert(d.clone()) {
+        if others.contains(&d) || !done.insert(d.clone()) || !valid_digest(&d) {
             continue;
         }
-        let Some(b) = blob_file(&models, &d) else { continue };
-        if !b.parent().is_some_and(|p| same_path(p, &blobs)) {
+        let name = d.replace(':', "-");
+        let h = match bh.open_rel(std::ffi::OsStr::new(&name), win::Open::Delete) {
+            Ok(h) => h,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        let Some(i) = h.info() else {
+            failed += 1;
             continue;
-        }
-        let Ok(h) = win::Handle::open(&b, win::Open::Delete) else { continue };
-        let Some(i) = h.info() else { continue };
+        };
         if i.is_dir() || i.is_reparse() || i.is_cloud() {
             continue;
         }
-        if h.delete().is_ok() && i.links <= 1 {
-            freed += i.size;
+        let real = h.allocated().map_or(i.size, |a| a.min(i.size));
+        match h.delete() {
+            Ok(()) if i.links <= 1 => freed += real,
+            Ok(()) => {}
+            Err(_) => failed += 1,
         }
     }
-    Ok(freed)
+    Ok((freed, failed))
 }
 
 /// 已知模型庫的位置（遞迴找模型檔）。
@@ -409,44 +437,57 @@ pub fn dedup(v: &mut Vec<Model>) {
     v.retain(|m| seen.insert(m.path.to_string_lossy().to_lowercase(), ()).is_none());
 }
 
-/// 刪「重複的模型」之前確認：保留的那份還在、和要刪的不是同一個實體檔案（大小寫不同的路徑、硬連結），
-/// 而且逐位元組內容完全相同。只比對檔名和大小不夠：同架構的不同微調結果大小常常一模一樣。
-pub fn verify_duplicate(del: &Path, keep: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    use std::io::Read;
-    let id_del = win::file_id(del).ok_or("讀不到要刪的檔案")?;
-    let id_keep = win::file_id(keep).ok_or_else(|| format!("保留的那份（{}）不見了", keep.display()))?;
-    if id_del == id_keep {
+/// 刪除「重複的模型」：要刪的（del）和保留的（keep）都以 handle 打開並鎖住（別人不能寫、不能刪、不能改名），
+/// 確認兩個都是一般檔案（不是連結、不是雲端檔）、不是同一個實體檔案（大小寫不同的路徑、硬連結），
+/// 逐位元組內容完全相同，最後用同一個 handle 刪掉 del；整個過程 keep 都鎖著。回傳釋放的位元組數。
+/// 只比對檔名和大小不夠：同架構的不同微調結果大小常常一模一樣。
+pub fn delete_duplicate(del: &Path, keep: &Path, cancel: &AtomicBool) -> Result<u64, String> {
+    let open = |p: &Path, mode: win::Open, what: &str| -> Result<(Vec<win::Handle>, win::Handle, win::HInfo), String> {
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else {
+            return Err(format!("{what}路徑格式不對"));
+        };
+        let pins = win::pin_dir(dir).map_err(|e| format!("{what}所在資料夾經過連結或無法鎖定（{e}）"))?;
+        let h = pins.last().expect("pin_dir 至少回傳一層").open_rel(name, mode).map_err(|e| format!("{what}無法打開（{e}）"))?;
+        let i = h.info().ok_or_else(|| format!("讀不到{what}的資訊"))?;
+        if i.is_dir() || i.is_reparse() || i.is_cloud() {
+            return Err(format!("{what}不是一般檔案（可能是連結或雲端檔）"));
+        }
+        Ok((pins, h, i))
+    };
+    let (_pd, hd, id) = open(del, win::Open::ReadDelete, "要刪的檔案")?;
+    let (_pk, hk, ik) = open(keep, win::Open::ReadLocked, &format!("保留的那份（{}）", keep.display()))?;
+    if (id.volume, id.index) == (ik.volume, ik.index) {
         return Err(format!("和 {} 其實是同一個檔案", keep.display()));
     }
-    let mut a = std::fs::File::open(del).map_err(|e| e.to_string())?;
-    let mut b = std::fs::File::open(keep).map_err(|e| e.to_string())?;
-    let (la, lb) = (a.metadata().map_err(|e| e.to_string())?.len(), b.metadata().map_err(|e| e.to_string())?.len());
-    if la != lb {
+    if id.size != ik.size {
         return Err(format!("和 {} 大小不同", keep.display()));
     }
     const CHUNK: usize = 8 << 20;
     let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("已取消".into());
-        }
-        let n = read_full(&mut a, &mut ba).map_err(|e| e.to_string())?;
-        let m = read_full(&mut b, &mut bb).map_err(|e| e.to_string())?;
-        if n != m || ba[..n] != bb[..m] {
-            return Err(format!("和 {} 內容不同，不是重複檔", keep.display()));
-        }
-        if n == 0 {
-            return Ok(());
-        }
-    }
-    fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let read_full = |h: &win::Handle, buf: &mut [u8]| -> Result<usize, String> {
         let mut n = 0;
         while n < buf.len() {
-            match f.read(&mut buf[n..])? {
+            match h.read(&mut buf[n..]).map_err(|e| e.to_string())? {
                 0 => break,
                 k => n += k,
             }
         }
         Ok(n)
+    };
+    loop {
+        if cancel.load(Relaxed) {
+            return Err("已取消".into());
+        }
+        let n = read_full(&hd, &mut ba)?;
+        let m = read_full(&hk, &mut bb)?;
+        if n != m || ba[..n] != bb[..m] {
+            return Err(format!("和 {} 內容不同，不是重複檔", keep.display()));
+        }
+        if n == 0 {
+            break;
+        }
     }
+    let real = hd.allocated().map_or(id.size, |a| a.min(id.size));
+    hd.delete().map_err(|e| format!("刪除失敗（{e}）"))?;
+    Ok(if id.links <= 1 { real } else { 0 })
 }
