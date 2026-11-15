@@ -183,45 +183,67 @@ fn not_found(p: &Path) -> bool {
 /// 有引號就取引號內；沒有引號就由短到長嘗試「前幾個片段」，有存在的檔案（或補上 .exe 後存在）就用它；
 /// 都不存在時，取第一個以可執行副檔名結尾的片段。相對路徑（rundll32.exe、cmd）交給系統的 PATH，不判斷存不存在。
 fn resolve_exe(cmd: &str) -> (Option<PathBuf>, bool) {
+    let (exe, missing, _) = parse_command(cmd);
+    (exe, missing)
+}
+
+/// 同 resolve_exe，另外回傳程式後面的參數（已展開環境變數）。
+fn parse_command(cmd: &str) -> (Option<PathBuf>, bool, String) {
     let c = expand_env(cmd.trim());
     if let Some(rest) = c.strip_prefix('"') {
-        let Some(e) = rest.find('"') else { return (None, false) };
-        let p = PathBuf::from(&rest[..e]);
-        let missing = p.is_absolute() && not_found(&p);
-        return (Some(p), missing);
+        let Some(e) = rest.find('"') else { return (None, false, String::new()) };
+        let (s, args) = (&rest[..e], rest[e + 1..].trim().to_string());
+        let p = PathBuf::from(s);
+        if !p.is_absolute() {
+            return (Some(p), false, args);
+        }
+        if p.is_file() || has_runnable_ext(s) {
+            let missing = not_found(&p);
+            return (Some(p), missing, args);
+        }
+        // 和 CreateProcess 一樣：沒寫副檔名時補上 .exe 再找
+        let with_exe = PathBuf::from(format!("{s}.exe"));
+        if with_exe.is_file() {
+            return (Some(with_exe), false, args);
+        }
+        let missing = not_found(&p) && not_found(&with_exe);
+        return (Some(p), missing, args);
     }
-    let parts: Vec<&str> = c.split(' ').collect();
-    let mut first_named: Option<String> = None;
-    for k in 1..=parts.len() {
-        let cand = parts[..k].join(" ");
-        let cand = cand.trim_end();
+    // 沒有引號：由短到長，在每個空白（或 tab）處切一刀試試看
+    let mut cuts: Vec<usize> = c.char_indices().filter(|&(_, ch)| ch == ' ' || ch == '\t').map(|(i, _)| i).collect();
+    cuts.push(c.len());
+    let first_end = cuts[0];
+    let rest_from = |end: usize| c[end..].trim().to_string();
+    let mut first_named: Option<(String, usize)> = None;
+    for &end in &cuts {
+        let cand = c[..end].trim_end();
         if cand.is_empty() {
             continue;
         }
         let p = Path::new(cand);
         if !p.is_absolute() {
             // 相對名稱：只看第一個片段
-            return (Some(PathBuf::from(parts[0])), false);
+            return (Some(PathBuf::from(&c[..first_end])), false, rest_from(first_end));
         }
         if p.is_file() {
-            return (Some(p.to_path_buf()), false);
+            return (Some(p.to_path_buf()), false, rest_from(end));
         }
         let with_exe = PathBuf::from(format!("{cand}.exe"));
         if !has_runnable_ext(cand) && with_exe.is_file() {
-            return (Some(with_exe), false);
+            return (Some(with_exe), false, rest_from(end));
         }
         if first_named.is_none() && has_runnable_ext(cand) {
-            first_named = Some(cand.to_string());
+            first_named = Some((cand.to_string(), end));
         }
     }
     match first_named {
-        Some(n) => {
+        Some((n, end)) => {
             let p = PathBuf::from(n);
             let missing = not_found(&p);
-            (Some(p), missing)
+            (Some(p), missing, rest_from(end))
         }
         // 判斷不出來：當成存在，不亂報
-        None => (parts.first().map(PathBuf::from), false),
+        None => (Some(PathBuf::from(&c[..first_end])), false, rest_from(first_end)),
     }
 }
 
@@ -369,6 +391,8 @@ pub struct StartupItem {
     pub store_key: Option<String>,
     /// 開機效能記錄裡，這個程式平均讓開機多花的毫秒數（有記錄才有）
     pub delay_ms: Option<u32>,
+    /// 程式後面的參數（Run 機碼才有；給「問 AI」判斷要不要省略）
+    pub args: String,
 }
 
 /// StartupApproved 的值：第一個位元組是偶數（02、06）＝啟用，奇數（03、07）＝停用；沒有這個值＝啟用。
@@ -400,7 +424,7 @@ fn run_entries(root: HKEY, path: &str, source: Source, out: &mut Vec<StartupItem
         if command.trim().is_empty() {
             continue;
         }
-        let (exe, missing) = resolve_exe(&command);
+        let (exe, missing, args) = parse_command(&command);
         out.push(StartupItem {
             enabled: approved_enabled(source, &name),
             display: pretty(&name),
@@ -412,6 +436,7 @@ fn run_entries(root: HKEY, path: &str, source: Source, out: &mut Vec<StartupItem
             policy: false,
             store_key: None,
             delay_ms: None,
+            args,
         });
     }
 }
@@ -452,6 +477,7 @@ fn folder_entries(dir: Option<PathBuf>, source: Source, out: &mut Vec<StartupIte
             policy: false,
             store_key: None,
             delay_ms: None,
+            args: String::new(),
         });
     }
 }
@@ -494,6 +520,7 @@ fn store_entries(out: &mut Vec<StartupItem>) {
                 policy: state >= 3,
                 store_key: Some(task_path),
                 delay_ms: None,
+                args: String::new(),
                 name: task,
             });
         }
@@ -538,15 +565,16 @@ fn write_enabled(item: &StartupItem, on: bool) -> Result<(), String> {
 }
 
 /// 啟用或停用一組開機自動啟動的程式。寫入前重新讀取一次清單，確認每一項都還在原來的位置、
-/// 名稱與指令一字不差；不會刪除或改動 Run 值、捷徑或 Store 套件本身。回傳（成功數, 第一個錯誤）。
+/// 名稱與指令一字不差，並且用「重新讀到的那一筆」判斷能不能改（例如 Store 工作剛被原則鎖定）；
+/// 不會刪除或改動 Run 值、捷徑或 Store 套件本身。回傳（成功數, 第一個錯誤）。
 pub fn set_enabled_many(items: &[StartupItem], on: bool) -> (usize, Option<String>) {
     let now = startup_items();
     let mut ok = 0;
     for it in items {
-        if !now.iter().any(|n| same_item(n, it)) {
+        let Some(fresh) = now.iter().find(|n| same_item(n, it)) else {
             return (ok, Some(format!("{} 已經不在了，請重新整理", it.display)));
-        }
-        match write_enabled(it, on) {
+        };
+        match write_enabled(fresh, on) {
             Ok(()) => ok += 1,
             Err(e) => return (ok, Some(e)),
         }
@@ -727,10 +755,14 @@ pub fn boot_log() -> BootLog {
 
     let mut note = (!boots_complete).then(|| "開機記錄沒有完整讀完，顯示的可能不是全部".to_string());
     let mut slow: Vec<SlowItem> = Vec::new();
-    match query_events("*[System[(EventID>=101 and EventID<=110)]]", 400) {
+    // 記錄檔預設最大 1 MB，通常只有幾百到一兩千筆；讀到上限就說明只讀了最近幾筆
+    const SLOW_MAX: usize = 3000;
+    match query_events("*[System[(EventID>=101 and EventID<=110)]]", SLOW_MAX) {
         Ok((list, complete)) => {
             if !complete {
                 note = Some("拖慢開機的記錄沒有完整讀完，顯示的可能不是全部".into());
+            } else if list.len() >= SLOW_MAX {
+                note = Some(format!("拖慢開機的記錄很多，只讀了最近 {SLOW_MAX} 筆"));
             }
             for x in &list {
                 let kind = match event_id(x).unwrap_or(0) {
@@ -910,10 +942,14 @@ fn powercfg(args: &[&str]) -> Result<(), String> {
 /// （reduced：只給快速啟動用，約記憶體的 20%）。關閉只改 HiberbootEnabled，不動休眠。
 pub fn set_fast_startup(on: bool) -> Result<(), String> {
     if on {
-        let was_on = sys_check().hibernate == Some(true);
-        if !was_on {
-            powercfg(&["/h", "on"])?;
-            powercfg(&["/h", "/type", "reduced"])?;
+        match sys_check().hibernate {
+            Some(true) => {}
+            Some(false) => {
+                powercfg(&["/h", "on"])?;
+                powercfg(&["/h", "/type", "reduced"])?;
+            }
+            // 判斷不出休眠開沒開：只確保它開著，不動休眠檔類型（原本可能是完整休眠）
+            None => powercfg(&["/h", "on"])?,
         }
     }
     write_value(HKEY_LOCAL_MACHINE, POWER, "HiberbootEnabled", REG_DWORD, &(on as u32).to_le_bytes())
@@ -957,27 +993,34 @@ pub fn run(action: Action) -> Option<(String, bool)> {
     }
 }
 
+/// 會被很多不同項目共用的宿主程式（指令列決定實際做什麼），不能用路徑對應到單一個開機項目
+fn is_host(p: &Path) -> bool {
+    const HOSTS: &[&str] = &[
+        "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "rundll32.exe", "mshta.exe", "regsvr32.exe", "msiexec.exe",
+        "explorer.exe", "conhost.exe", "dllhost.exe", "svchost.exe", "java.exe", "javaw.exe", "node.exe", "py.exe", "pyw.exe",
+    ];
+    let f = p.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+    HOSTS.contains(&f.as_str()) || (f.starts_with("python") && f.ends_with(".exe"))
+}
+
 /// 讀取全部（在背景執行緒呼叫）
 pub fn load() -> BootData {
     let mut log = boot_log();
     let mut items = startup_items();
-    // 開機記錄裡「程式」類的項目，用完整路徑對到開機自動啟動的程式（8.3 短檔名先換成長路徑）；
-    // 記錄裡沒有路徑時才比檔名。兩邊都記下對應關係：啟動清單顯示「多花幾秒」，拖慢清單可以直接停用。
+    // 開機記錄裡「程式」類的項目，只用完整路徑對到開機自動啟動的程式（兩邊都先換成實際的長路徑）。
+    // 記錄沒有路徑時不比檔名（不同資料夾的同名程式會被錯連）；cmd、powershell、rundll32 之類的宿主程式
+    // 會被很多項目共用，也不對應。兩邊都記下對應關係：啟動清單顯示「多花幾秒」，拖慢清單可以直接停用。
     if let BootLog::Ok { slow, .. } = &mut log {
-        let keys: Vec<Option<(String, String)>> = items
-            .iter()
-            .map(|it| {
-                let exe = it.exe.as_ref()?;
-                let file = exe.file_name()?.to_string_lossy().to_lowercase();
-                let full = win::final_path(exe).unwrap_or_else(|| exe.clone()).to_string_lossy().to_lowercase();
-                Some((full, file))
-            })
-            .collect();
-        for s in slow.iter_mut().filter(|s| s.kind == "程式") {
-            let (path, raw) = (s.path.to_lowercase(), s.raw.to_lowercase());
+        let norm = |p: &Path| win::final_path(p).unwrap_or_else(|| p.to_path_buf()).to_string_lossy().to_lowercase();
+        let keys: Vec<Option<String>> = items.iter().map(|it| it.exe.as_deref().filter(|e| e.is_absolute() && !is_host(e)).map(norm)).collect();
+        for s in slow.iter_mut().filter(|s| s.kind == "程式" && !s.path.is_empty()) {
+            let p = Path::new(&s.path);
+            if !p.is_absolute() || is_host(p) {
+                continue;
+            }
+            let path = norm(p);
             for (i, k) in keys.iter().enumerate() {
-                let Some((full, file)) = k else { continue };
-                if if path.is_empty() { raw == *file } else { path == *full } {
+                if k.as_deref() == Some(path.as_str()) {
                     s.startup.push(i);
                     if s.avg_degr() > 0 {
                         items[i].delay_ms = Some(items[i].delay_ms.unwrap_or(0).max(s.avg_degr()));
@@ -1014,6 +1057,7 @@ pub fn demo() -> BootData {
         policy: false,
         store_key: None,
         delay_ms: None,
+        args: String::new(),
     };
     let steam = r"C:\Program Files (x86)\Steam\steam.exe";
     let mut items = vec![
@@ -1022,6 +1066,7 @@ pub fn demo() -> BootData {
         item("SecurityHealth", r"%windir%\system32\SecurityHealthSystray.exe", r"C:\Windows\system32\SecurityHealthSystray.exe", Source::MachineRun, false),
         item("Helper", r"D:\Tools\helper\helper.exe --tray", r"D:\Tools\helper\helper.exe", Source::UserRun, false),
         item("CMNotify", r"D:\Program Files (x86)\CMoney\CMNotify.exe", r"D:\Program Files (x86)\CMoney\CMNotify.exe", Source::UserRun, true),
+        item("Helper Sync", r"D:\Tools\helper\helper.exe --sync", r"D:\Tools\helper\helper.exe", Source::UserRun, false),
     ];
     items[0].delay_ms = Some(30_000);
     let slow_item = |kind: &'static str, name: &str, raw: &str, path: &str, count: u32, avg: u32, startup: Vec<usize>| SlowItem {
@@ -1048,6 +1093,7 @@ pub fn demo() -> BootData {
         slow_item("程式", "crosvm.exe", "crosvm.exe", r"C:\Program Files\Google\Play Games\current\emulator\crosvm.exe", 1, 98_300, vec![]),
         slow_item("程式", "Windows Services 的主機處理程序", "svchost.exe", r"C:\Windows\System32\svchost.exe", 17, 4_700, vec![]),
         slow_item("服務", "Demo Sync Service", "demosync.exe", r"C:\Program Files\Demo\demosync.exe", 2, 8_000, vec![]),
+        slow_item("程式", "Helper", "helper.exe", r"D:\Tools\helper\helper.exe", 2, 12_000, vec![3, 5]),
         slow_item("驅動程式", "Realtek PCIe GbE Family Controller", "rt640x64.sys", "", 3, 3_000, vec![]),
     ];
     slow.sort_by(|a, b| b.degr_ms.cmp(&a.degr_ms));
@@ -1104,6 +1150,13 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         ("啟動項目：參數裡的 .exe 不會被當成程式", resolve_exe(r"C:\Scripts\boot.cmd --log C:\logs\x.exe").0 == Some(PathBuf::from(r"C:\Scripts\boot.cmd"))),
         ("啟動項目：省略 .exe 也找得到", resolve_exe(&format!(r"{}\System32\cmd /c echo", sysroot)) == (Some(cmd_exe), false)),
         ("啟動項目：相對路徑不算找不到", resolve_exe("rundll32.exe shell32.dll,Control_RunDLL").1 == false),
+        (
+            "啟動項目：有引號但省略 .exe 也找得到",
+            parse_command(&format!(r#""{sysroot}\System32\cmd" /c echo"#)) == (Some(PathBuf::from(&sysroot).join(r"System32\cmd.exe")), false, "/c echo".into()),
+        ),
+        ("啟動項目：tab 也算分隔", parse_command(&format!("{sysroot}\\System32\\cmd.exe\t/c")).2 == "/c"),
+        ("啟動項目：取出參數", parse_command(r#""C:\__dc_none__\x.exe" --a b"#).2 == "--a b" && parse_command(r"C:\__dc_none__\y.exe -q").2 == "-q"),
+        ("啟動項目：宿主程式不對應到單一項目", is_host(Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")) && is_host(Path::new(r"C:\Python312\python3.12.exe")) && !is_host(Path::new(r"C:\Apps\steam.exe"))),
         ("啟動項目：解析捷徑目標", lnk_target_bytes(&lnk) == Some(PathBuf::from(r"C:\Apps\Tool\tool.exe"))),
         ("啟動項目：壞掉的捷徑不會當掉", lnk_target_bytes(&lnk[..0x50]).is_none()),
         ("啟動項目：Store 應用程式名稱", store_display("5319275A.WhatsAppDesktop_cv1g1gvanyjgm", "x") == "WhatsAppDesktop" && store_display("Microsoft.549981C3F5F10_8wekyb3d8bbwe", "CortanaStartupId") == "Cortana"),

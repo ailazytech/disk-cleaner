@@ -69,8 +69,8 @@ Models are never pre-selected.
 - Programs, drivers, services and devices that Windows recorded as slowing down boot
 - Programs that start automatically (Run keys, Startup folders with shortcut targets resolved, and Microsoft Store app startup tasks): turn them off or on the same way Task Manager's Startup tab does. Nothing is uninstalled or deleted, entries whose program is gone are flagged, and identical entries (Edge often registers dozens) are grouped
 - Checks for Fast Startup, free space on the system drive, and whether Windows is on an SSD
-- A suggestion tag on every startup program and slow-boot item: *don't start at boot*, *start later* or *keep* (security software, drivers, input methods). Hover for what it is and how to handle it; anything not recognized is marked *not sure*. Slow-boot items that are also startup programs can be turned off right there
-- *Ask AI*: copies a ready-made question about one item, or a full report of the page, for ChatGPT, Claude or Gemini. Your user folder in paths is replaced with `%USERPROFILE%`; nothing is sent anywhere, it only goes to the clipboard
+- A suggestion tag on every startup program and slow-boot item: *don't start at boot*, *start later* or *keep* (security software, drivers, input methods, VPNs and password managers). Hover for what it is and how to handle it; anything not recognized is marked *not sure*. Slow-boot items that are also startup programs can be turned off right there
+- *Ask AI*: copies a ready-made question about one item, or a full report of the page, for ChatGPT, Claude or Gemini. Your user folder is replaced with `%USERPROFILE%`, other user names and e-mail addresses are masked, and command-line arguments keep only their switch names. Nothing is sent anywhere; it only goes to the clipboard, so glance over it before pasting
 
 Reading the boot log needs administrator rights. Windows does not write this log on every boot, so the page says when the newest record is old.
 
@@ -101,7 +101,7 @@ Wrongly deleting your data is the worst thing a cleaner can do, so the deletion 
 - Files in use are skipped; cloud placeholders (OneDrive) are never deleted; with an age limit, recently created folders are kept; files with other hard links don't count as freed space
 - **Move to Recycle Bin** goes through the same checks as permanent delete (including cloud files anywhere inside a folder) and asks before permanently deleting something that can't be recycled; the analyzer refuses to delete stale cached data, or anything created or modified after the scan, until you rescan
 - Clean rules delete permanently (that is how space gets freed)
-- `disk-cleaner.exe --selftest` runs 108 checks in a scratch folder (a reversible startup-entry registry round trip, junctions, a folder turned into a junction in place mid-clean, folders held open against renaming, 8.3 short names, hard links, simulated cloud files, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
+- `disk-cleaner.exe --selftest` runs 122 checks in a scratch folder (a reversible startup-entry registry round trip, junctions, a folder turned into a junction in place mid-clean, folders held open against renaming, 8.3 short names, hard links, simulated cloud files, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
 
 The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes went through two more review rounds; the issues found are fixed and covered by the self-test.
 

@@ -508,7 +508,7 @@ fn selftest() -> bool {
     // 11b. 8.3 短檔名：清理時用的是 handle 的實際長路徑（受保護資料夾比對才不會漏）
     let longdir = base.join("Long Folder Name For Short");
     fs::create_dir_all(&longdir).unwrap();
-    let short = short_path(&longdir).unwrap_or_else(|| longdir.clone());
+    let short = win::short_path(&longdir).unwrap_or_else(|| longdir.clone());
     let real = win::pin_dir(&short).ok().and_then(|v| v.last().and_then(|h| h.real_path()));
     // 期望值要用完全展開的長路徑：暫存資料夾本身可能就是短檔名（例如 CI 的 C:\Users\RUNNER~1）
     let expect = win::final_path(&longdir).unwrap_or_else(|| longdir.clone());
@@ -594,14 +594,6 @@ fn set_junction(dir: &std::path::Path, target: &std::path::Path) -> bool {
     }
 }
 
-/// 自我測試用：8.3 短檔名（磁碟關掉短檔名時回傳 None）。
-fn short_path(p: &std::path::Path) -> Option<std::path::PathBuf> {
-    let w = win::wide(p);
-    let mut buf = [0u16; 1024];
-    let n = unsafe { windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n])))
-}
-
 /// 自我測試用：加上 OFFLINE 屬性，模擬雲端佔位檔。
 fn set_offline(p: &std::path::Path) {
     let w = win::wide(p);
@@ -616,6 +608,11 @@ fn icon() -> eframe::egui::IconData {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 命令列模式：接上啟動它的主控台，輸出才看得到（release 版是 GUI 程式）
+    const CLI: &[&str] = &["--bench", "--selftest", "--rules", "--bench-delete", "--projects", "--boot-report"];
+    if args.get(1).is_some_and(|a| CLI.contains(&a.as_str())) {
+        win::attach_parent_console();
+    }
     match args.get(1).map(|s| s.as_str()) {
         Some("--bench") if args.len() >= 3 => {
             bench(&args[2], args.get(3).is_some_and(|s| s == "cache"));
@@ -678,10 +675,11 @@ fn main() {
                 a.tab = app::Tab::Clean;
                 a.start_demo_clean(&cc.egui_ctx);
             }
-            // --demo-boot：開機加速分頁改用假資料（截圖、看版面用），按鈕都不會改設定
+            // --demo-boot：開機加速分頁改用假資料（截圖、看版面用），這個分頁的按鈕不會改設定（其他分頁照常運作）
             if demo_boot {
                 a.tab = app::Tab::Boot;
                 a.boot.demo = true;
+                a.boot.scroll_to_slow = args.iter().any(|x| x == "slow");
             }
             Ok(Box::new(a))
         }));

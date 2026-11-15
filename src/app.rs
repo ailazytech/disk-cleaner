@@ -41,8 +41,10 @@ pub struct BootState {
     pub copied: Option<(String, f64)>,
     /// 拖慢開機的項目全部列出（預設只列前 15 項）
     pub show_all_slow: bool,
-    /// 示範模式（--demo-boot）：顯示假資料，所有按鈕都不會改設定
+    /// 示範模式（--demo-boot）：開機加速分頁顯示假資料，這個分頁的按鈕都不會改設定
     pub demo: bool,
+    /// 截圖用（--demo-boot slow）：第一次畫好就捲到「拖慢開機的項目」
+    pub scroll_to_slow: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -191,6 +191,36 @@ pub fn final_path(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)))
 }
 
+/// 8.3 短路徑（磁碟關掉短檔名、或路徑不存在時回傳 None）。
+pub fn short_path(p: &Path) -> Option<PathBuf> {
+    let w = wide(p);
+    let mut buf = [0u16; 1024];
+    let n = unsafe { windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+}
+
+/// 命令列模式（--boot-report 等）用：GUI 程式沒有主控台，標準輸出沒被導向時，接到啟動它的主控台上，
+/// 讓 println! 看得到。已經導向到檔案或管線時不動。
+pub fn attach_parent_console() {
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+    let valid = |h: HANDLE| !h.is_null() && h != INVALID_HANDLE_VALUE;
+    unsafe {
+        if valid(GetStdHandle(STD_OUTPUT_HANDLE)) || AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        // 有些情況接上主控台後標準輸出仍是空的：直接開 CONOUT$
+        if !valid(GetStdHandle(STD_OUTPUT_HANDLE)) {
+            let name = wide("CONOUT$");
+            let h = CreateFileW(name.as_ptr(), 0x4000_0000 | 0x8000_0000, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut());
+            if valid(h) {
+                SetStdHandle(STD_OUTPUT_HANDLE, h);
+                SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+        }
+    }
+}
+
 /// 現在時間（FILETIME 單位）。
 pub fn now_filetime() -> u64 {
     let unix = std::time::SystemTime::now()

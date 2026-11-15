@@ -37,6 +37,9 @@ $pt.X = $X; $pt.Y = $Y
 $screen = [IntPtr](($pt.Y -shl 16) -bor ($pt.X -band 0xFFFF))
 $step = if ($Notches -lt 0) { -120 } else { 120 }
 for ($i = 0; $i -lt [Math]::Abs($Notches); $i++) {
+  # The real cursor may be elsewhere (the app then sees "mouse left"), so
+  # repeat the pointer position before every wheel step.
+  [SW]::PostMessage($h, 0x0200, [IntPtr]::Zero, $client) | Out-Null
   $w = [IntPtr]([int]($step -shl 16))
   [SW]::PostMessage($h, 0x020A, $w, $screen) | Out-Null   # WM_MOUSEWHEEL
   Start-Sleep -Milliseconds 40
