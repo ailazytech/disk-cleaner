@@ -308,6 +308,11 @@ fn selftest() -> bool {
     // 8. 萬用字元
     check("萬用字元比對", rules::wildcard("thumbcache_*.db", "ThumbCache_1024.DB") && !rules::wildcard("*.exe", "a.exe.txt"));
 
+    // 9. MFT 紀錄解析
+    for (name, cond) in mft::selftest() {
+        check(name, cond);
+    }
+
     let _ = fs::remove_dir_all(&base);
     println!("{}", if ok { "全部通過" } else { "有測試失敗" });
     ok

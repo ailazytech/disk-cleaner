@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::tree::{RawNode, RawTree};
 
-const MAGIC: &[u8; 8] = b"DCIDX\0\0\x02";
+// 版本 3：MFT 大小扣掉沒有稀疏旗標的空洞（舊索引的 $BadClus 會是整顆磁碟大小）
+const MAGIC: &[u8; 8] = b"DCIDX\0\0\x03";
 
 pub const METHOD_WALK: u8 = 0;
 pub const METHOD_MFT: u8 = 1;

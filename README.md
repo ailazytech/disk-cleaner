@@ -88,7 +88,7 @@ Wrongly deleting your data is the worst thing a cleaner can do, so the deletion 
 - Files in use are skipped; cloud placeholders (OneDrive) are never deleted
 - **Move to Recycle Bin** asks before permanently deleting something that can't be recycled; the analyzer refuses to delete from stale cached data until you rescan
 - Clean rules delete permanently (that is how space gets freed)
-- `disk-cleaner.exe --selftest` runs 44 checks in a scratch folder (junctions, read-only files, protected-path aliases, fake projects, a fake Ollama store with a malicious manifest…); CI runs it on every push
+- `disk-cleaner.exe --selftest` runs 47 checks in a scratch folder (junctions, read-only files, protected-path aliases, fake projects, a fake Ollama store with a malicious manifest, synthetic MFT records…); CI runs it on every push
 
 The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release; the issues they found are fixed and covered by the self-test.
 

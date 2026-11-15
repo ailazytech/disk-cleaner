@@ -279,7 +279,7 @@ struct Parsed {
 }
 
 /// 解析一筆（已修正過的）FILE 紀錄。不在使用中回傳 None。
-fn parse_record(rec: &[u8], rec_no: u32, names: &mut Vec<u8>) -> Option<Parsed> {
+fn parse_record(rec: &[u8], rec_no: u32, bpc: u64, names: &mut Vec<u8>) -> Option<Parsed> {
     if rec.len() < 48 || &rec[0..4] != b"FILE" {
         return None;
     }
@@ -336,11 +336,19 @@ fn parse_record(rec: &[u8], rec_no: u32, names: &mut Vec<u8>) -> Option<Parsed> 
             0x80 => {
                 if nonres {
                     if len >= 64 && u64_at(rec, p + 16) == 0 {
-                        // 稀疏或壓縮：用實際配置的大小；否則用配置大小
                         if aflags & (0x0001 | 0x8000) != 0 && len >= 72 {
+                            // 稀疏或壓縮：用實際配置的大小
                             size += u64_at(rec, p + 64);
                         } else {
-                            size += u64_at(rec, p + 40);
+                            // 配置大小，但扣掉沒有實體位置的空洞。$BadClus:$Bad 沒有稀疏旗標，
+                            // 帳面大小卻等於整顆磁碟，實際上整段都是空洞。
+                            let mut holes = 0u64;
+                            each_run(rec, p, |r| {
+                                if r.lcn.is_none() {
+                                    holes = holes.saturating_add(r.len);
+                                }
+                            });
+                            size += u64_at(rec, p + 40).saturating_sub(holes.saturating_mul(bpc));
                         }
                     }
                 } else if len >= 24 {
@@ -403,6 +411,10 @@ struct Run {
 }
 
 fn decode_runs(rec: &[u8], attr: usize, out: &mut Vec<Run>) {
+    each_run(rec, attr, |r| out.push(r));
+}
+
+fn each_run(rec: &[u8], attr: usize, mut f: impl FnMut(Run)) {
     let start_vcn = u64_at(rec, attr + 16);
     let mut p = attr + u16_at(rec, attr + 32) as usize;
     let end = attr + u32_at(rec, attr + 4) as usize;
@@ -432,7 +444,7 @@ fn decode_runs(rec: &[u8], attr: usize, out: &mut Vec<Run>) {
             lcn += off;
             Some(lcn as u64)
         };
-        out.push(Run { vcn, lcn: run_lcn, len: length });
+        f(Run { vcn, lcn: run_lcn, len: length });
         vcn += length;
         p += 1 + ls + os;
     }
@@ -691,7 +703,7 @@ pub fn scan_volume(vol: &Volume, root_name: &str, prog: &Progress) -> io::Result
                         if !fixup(r, true) {
                             continue;
                         }
-                        if let Some(p) = parse_record(r, (first + i) as u32, &mut names) {
+                        if let Some(p) = parse_record(r, (first + i) as u32, bpc, &mut names) {
                             items.push(p);
                         }
                     }
@@ -790,6 +802,7 @@ pub fn read_changes(vol: &Volume, jd: &JournalData, from_usn: i64) -> Changes {
 /// 把變動的紀錄重新讀取並套用到原始樹。回傳實際套用的筆數。
 pub fn apply_changes(vol: &Volume, raw: &mut RawTree, recs: &[u32], root_name: &str) -> usize {
     use rayon::prelude::*;
+    let bpc = vol.data.bytes_per_cluster as u64;
     // 平行取回紀錄並解析
     let parsed: Vec<(u32, Option<(Vec<u8>, Parsed)>)> = recs
         .par_iter()
@@ -797,7 +810,7 @@ pub fn apply_changes(vol: &Volume, raw: &mut RawTree, recs: &[u32], root_name: &
             let res = vol.fetch_record(r).and_then(|mut buf| {
                 fixup(&mut buf, false);
                 let mut names = Vec::new();
-                parse_record(&buf, r, &mut names).map(|p| (names, p))
+                parse_record(&buf, r, bpc, &mut names).map(|p| (names, p))
             });
             (r, res)
         })
@@ -858,4 +871,58 @@ pub fn compact_names(raw: &mut RawTree) {
         n.name_start = start;
     }
     raw.names = names;
+}
+
+// ---------------------------------------------------------------------------
+// 自我測試
+
+/// 組一筆只有一個非常駐 $DATA 的檔案紀錄。runs：(叢集數, 是否有實體位置)。
+fn test_record(runs: &[(u32, bool)], attr_flags: u16, bpc: u64) -> Vec<u8> {
+    let mut r = vec![0u8; 1024];
+    r[0..4].copy_from_slice(b"FILE");
+    r[20..22].copy_from_slice(&56u16.to_le_bytes());
+    r[22..24].copy_from_slice(&1u16.to_le_bytes());
+    let mut rl = Vec::new();
+    let mut clusters = 0u64;
+    for &(len, real) in runs {
+        if real {
+            rl.push(0x44);
+            rl.extend(len.to_le_bytes());
+            rl.extend(1000i32.to_le_bytes());
+        } else {
+            rl.push(0x04);
+            rl.extend(len.to_le_bytes());
+        }
+        clusters += len as u64;
+    }
+    rl.push(0);
+    let a = 56;
+    let alen = (64 + rl.len()).div_ceil(8) * 8;
+    r[a..a + 4].copy_from_slice(&0x80u32.to_le_bytes());
+    r[a + 4..a + 8].copy_from_slice(&(alen as u32).to_le_bytes());
+    r[a + 8] = 1;
+    r[a + 12..a + 14].copy_from_slice(&attr_flags.to_le_bytes());
+    r[a + 24..a + 32].copy_from_slice(&(clusters.saturating_sub(1)).to_le_bytes());
+    r[a + 32..a + 34].copy_from_slice(&64u16.to_le_bytes());
+    for o in [40, 48, 56] {
+        r[a + o..a + o + 8].copy_from_slice(&(clusters * bpc).to_le_bytes());
+    }
+    r[a + 64..a + 64 + rl.len()].copy_from_slice(&rl);
+    let end = a + alen;
+    r[end..end + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    r[24..28].copy_from_slice(&((end + 8) as u32).to_le_bytes());
+    r
+}
+
+pub fn selftest() -> Vec<(&'static str, bool)> {
+    let bpc = 4096u64;
+    let size = |runs: &[(u32, bool)]| {
+        let mut names = Vec::new();
+        parse_record(&test_record(runs, 0, bpc), 100, bpc, &mut names).map(|p| p.size)
+    };
+    vec![
+        ("MFT：一般檔案用配置大小", size(&[(10, true)]) == Some(10 * bpc)),
+        ("MFT：沒有稀疏旗標的空洞不算（$BadClus:$Bad）", size(&[(500_000_000, false)]) == Some(0)),
+        ("MFT：資料與空洞混合時只算資料", size(&[(10, true), (90, false), (5, true)]) == Some(15 * bpc)),
+    ]
 }

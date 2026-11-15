@@ -45,7 +45,8 @@ pub fn load_all() -> HashMap<char, DriveSummary> {
     let Ok(text) = std::fs::read_to_string(file()) else { return out };
     for line in text.lines() {
         let p: Vec<&str> = line.split('\t').collect();
-        if p.len() != 6 || p[0] != "S" {
+        // S2：MFT 修正 $BadClus 之後的格式；舊的 S 行可能把整顆磁碟算進去，直接略過
+        if p.len() != 6 || p[0] != "S2" {
             continue;
         }
         let Some(letter) = p[1].chars().next() else { continue };
@@ -77,7 +78,7 @@ pub fn save_all(all: &HashMap<char, DriveSummary>) {
     for k in keys {
         let d = &all[k];
         let join = |a: &[u64; KIND_COUNT]| a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
-        s.push_str(&format!("S\t{}\t{}\t{}\t{}\t{}\n", d.letter, d.scanned_at, d.indexed, join(&d.kinds), join(&d.counts)));
+        s.push_str(&format!("S2\t{}\t{}\t{}\t{}\t{}\n", d.letter, d.scanned_at, d.indexed, join(&d.kinds), join(&d.counts)));
     }
     let _ = std::fs::create_dir_all(app_dir());
     let _ = std::fs::write(file(), s);

@@ -88,7 +88,7 @@
 - 使用中的檔案會略過；雲端佔位檔（OneDrive）一律不刪
 - **移到資源回收筒** 遇到無法回收的檔案會先詢問，不會靜默永久刪除；分析頁顯示的是快取舊資料時，要先重新掃描才能刪
 - 清理規則是永久刪除（這樣才會真正釋放空間）
-- `disk-cleaner.exe --selftest` 會在暫存資料夾跑 44 項檢查（junction、唯讀檔、受保護路徑的各種別名、假專案、含惡意 manifest 的假 Ollama 模型庫…）；CI 每次 push 都會跑
+- `disk-cleaner.exe --selftest` 會在暫存資料夾跑 47 項檢查（junction、唯讀檔、受保護路徑的各種別名、假專案、含惡意 manifest 的假 Ollama 模型庫、模擬的 MFT 紀錄…）；CI 每次 push 都會跑
 
 刪除相關的程式碼在發佈前經過兩個獨立的 AI 審查（OpenAI Codex 與 Google Gemini），找到的問題都已修正並加進自我測試。
 
