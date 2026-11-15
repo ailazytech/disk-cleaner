@@ -115,6 +115,7 @@ disk-cleaner.exe D:\Projects                   open and analyze a folder
 disk-cleaner.exe --rules                       print what each clean rule would free (deletes nothing)
 disk-cleaner.exe --projects C:\Users\me D:\    find build artifacts and AI models (deletes nothing)
 disk-cleaner.exe --bench C:\ [cache]           scan benchmark
+disk-cleaner.exe --bench-delete [N] [flat]     deletion benchmark (only deletes files it creates in %TEMP%)
 disk-cleaner.exe --selftest                    safety self-test in a scratch folder
 ```
 

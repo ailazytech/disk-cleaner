@@ -133,6 +133,8 @@ pub struct CleanJob {
     pub planned: u64,
     pub rule_idx: Vec<usize>,
     pub finished: Option<f32>,
+    /// 進度視窗的垃圾桶動畫
+    pub anim: crate::anim::TrashAnim,
 }
 
 pub struct CleanState {
@@ -526,6 +528,42 @@ impl App {
         (b, n)
     }
 
+    /// 只用來截圖、看動畫：模擬一次清理的進度。只改進度數字，不會刪除或碰任何檔案。
+    pub fn start_demo_clean(&mut self, ctx: &egui::Context) {
+        let prog = Arc::new(DelProgress::default());
+        let done = Arc::new(AtomicBool::new(false));
+        prog.steps.store(5, Relaxed);
+        self.clean.job = Some(CleanJob {
+            prog: prog.clone(),
+            done: done.clone(),
+            started: Instant::now(),
+            planned: 9_800_000_000,
+            rule_idx: Vec::new(),
+            finished: None,
+            anim: Default::default(),
+        });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let steps = [("npm 快取", "npm-cache\\_cacache\\content-v2\\sha512"), ("使用者暫存資料夾", "Temp\\pip-build-env-x8k2"), ("uv 快取", "uv\\cache\\archive-v0\\aB3dE"), ("Chrome 快取", "Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data"), ("縮圖快取", "Microsoft\\Windows\\Explorer")];
+            for (k, (name, sub)) in steps.iter().enumerate() {
+                for i in 0..220u64 {
+                    if prog.cancel.load(Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(9 + (k as u64 * 3)));
+                    prog.files.fetch_add(3 + i % 5, Relaxed);
+                    prog.freed.fetch_add(1_400_000 + (i % 7) * 900_000, Relaxed);
+                    *prog.current.lock() = format!("C:\\Users\\me\\AppData\\Local\\{sub}\\{:x}\\{:04}.tmp", i * 7919, i);
+                    ctx.request_repaint();
+                }
+                prog.log(format!("✔ {name}：釋放 {}", fmt::size(1_900_000_000 + k as u64 * 130_000_000)));
+                prog.step.fetch_add(1, Relaxed);
+            }
+            done.store(true, Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
     pub fn start_clean(&mut self, ctx: &egui::Context) {
         let prog = Arc::new(DelProgress::default());
         let done = Arc::new(AtomicBool::new(false));
@@ -575,6 +613,7 @@ impl App {
             planned,
             rule_idx,
             finished: None,
+            anim: Default::default(),
         });
         let ctx = ctx.clone();
         std::thread::spawn(move || {

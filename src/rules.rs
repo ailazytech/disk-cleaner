@@ -90,6 +90,31 @@ pub struct Rule {
 
 impl Rule {
     /// 為什麼可以清（「建議」標籤的說明）。
+    /// 標成「注意」的原因：刪了之後會怎樣、什麼情況先別刪。
+    pub fn caution_why(&self) -> &'static str {
+        match self.id {
+            "pnpm" => "所有專案共用的套件庫。各專案的 node_modules 用硬連結指向這裡，所以實際釋放的空間常比顯示的少；之後安裝新專案要重新下載。",
+            "conda" => "Conda 下載與解壓縮的套件。已建立的環境通常不受影響，但之後建立新環境要重新下載；官方建議用 conda clean 清理。",
+            "maven" => "本機倉庫裡可能有你自己 mvn install 的套件（網路上沒有），刪了就要重新建置；其他套件下次建置會重新下載。",
+            "pub" => "Flutter／Dart 套件快取。刪掉後每個專案要重新 pub get，沒有網路時無法建置。",
+            "playwright" => "測試用的瀏覽器（每個數百 MB）。刪掉後要執行 npx playwright install 才能再跑測試。",
+            "puppeteer" => "Puppeteer 下載的 Chrome。刪掉後要重新安裝才能使用。",
+            "cypress" => "Cypress 的執行檔。刪掉後要執行 npx cypress install 重新下載。",
+            "jetbrains" => "IDE 的索引與快取。刪掉後下次開專案要重建索引，大型專案要等一陣子。",
+            "docker" => "會移除停止的容器、沒在用的映像與建置快取。停止的容器裡如果有資料，會一起消失。",
+            "win_old" => "刪掉後就不能「回復到上一版 Windows」。剛升級完、還想保留退回的機會就先別刪。",
+            "win_upgrade" => "Windows 升級過程的暫存。升級還在進行或還沒完成時不要刪。",
+            "drivers" => "驅動程式解壓縮出來的安裝檔。之後要重裝或修復驅動時，需要重新下載。",
+            "patchcache" => "已安裝軟體的修補檔備份。刪掉後，有些軟體日後修復或解除安裝時會要求原始安裝檔。",
+            "pkgcache" => "Visual Studio 等安裝程式留下的套件。刪掉後修改、修復或解除安裝這些程式時，可能要重新下載甚至失敗。",
+            "hiberfil" => "會關閉休眠，也會一起關掉「快速啟動」，冷開機可能變慢。之後可以在「開機加速」分頁或用 powercfg /h on 開回來。",
+            "dl_installers" => "下載資料夾裡 7 天以上的安裝檔（.exe、.msi…）。刪掉後要用就得重新下載，請確認沒有找不到來源的檔案。",
+            "spotify" => "包含離線下載的歌曲。刪掉後要重新下載才能離線收聽。",
+            "recycle" => "清空之後就沒辦法從資源回收筒救回檔案了。",
+            _ => "刪掉後可能要重新下載，或影響某些功能，請確認用不到再清。",
+        }
+    }
+
     pub fn why(&self) -> String {
         let specific = match self.id {
             "npm" | "yarn" | "bun" | "pip" | "poetry" | "composer" | "nuget" => {
@@ -123,6 +148,7 @@ impl Rule {
         }
         match self.cat {
             Cat::Browser => "只刪網頁快取，不會動到書籤、密碼、Cookie 與登入狀態；瀏覽時會重新快取。".into(),
+            _ if self.risk == Risk::Caution => self.caution_why().to_string(),
             Cat::DevCache => "開發工具的快取，需要時會自動重新下載或重建。".into(),
             Cat::SysTemp => "系統或程式的暫存，需要時會自動重建。".into(),
             Cat::Apps => "應用程式的快取，下次開啟會自動重建。".into(),

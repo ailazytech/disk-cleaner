@@ -448,6 +448,29 @@ impl HInfo {
     }
 }
 
+/// 刪除時需要的資訊，一次系統呼叫拿齊（FileStatInformation）。
+#[derive(Clone, Copy, Debug)]
+pub struct HStat {
+    pub attrs: u32,
+    pub size: u64,
+    /// 實際占用的大小（稀疏、壓縮檔會比 size 小）
+    pub alloc: u64,
+    pub mtime: u64,
+    pub links: u32,
+}
+
+impl HStat {
+    pub fn is_dir(&self) -> bool {
+        self.attrs & ATTR_DIRECTORY != 0
+    }
+    pub fn is_reparse(&self) -> bool {
+        self.attrs & ATTR_REPARSE != 0
+    }
+    pub fn is_cloud(&self) -> bool {
+        self.attrs & ATTR_CLOUD_MASK != 0
+    }
+}
+
 /// handle 列舉出來的一筆
 #[derive(Clone, Debug)]
 pub struct DirEnt {
@@ -583,6 +606,37 @@ impl Handle {
             volume: d.dwVolumeSerialNumber,
             index: ((d.nFileIndexHigh as u64) << 32) | d.nFileIndexLow as u64,
         })
+    }
+
+    /// 刪除需要的資訊（屬性、大小、實際占用、修改時間、硬連結數）。Windows 10 1709 以後一次呼叫就拿齊，
+    /// 比 info()＋allocated() 少一次系統呼叫；舊版不支援時自動退回兩次呼叫。
+    pub fn stat(&self) -> Option<HStat> {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use windows_sys::Wdk::Storage::FileSystem::{FILE_STAT_INFORMATION, FileStatInformation, NtQueryInformationFile};
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+        if !UNSUPPORTED.load(Relaxed) {
+            let mut s: FILE_STAT_INFORMATION = unsafe { std::mem::zeroed() };
+            let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            let st = unsafe {
+                NtQueryInformationFile(self.0, &mut iosb, &mut s as *mut _ as *mut _, std::mem::size_of::<FILE_STAT_INFORMATION>() as u32, FileStatInformation)
+            };
+            if st >= 0 {
+                return Some(HStat {
+                    attrs: s.FileAttributes,
+                    size: s.EndOfFile.max(0) as u64,
+                    alloc: s.AllocationSize.max(0) as u64,
+                    mtime: s.LastWriteTime.max(0) as u64,
+                    links: s.NumberOfLinks,
+                });
+            }
+            // STATUS_INVALID_INFO_CLASS／STATUS_NOT_IMPLEMENTED：這版 Windows 沒有，之後都走舊方法
+            if st == 0xC000_0003u32 as i32 || st == 0xC000_0002u32 as i32 {
+                UNSUPPORTED.store(true, Relaxed);
+            }
+        }
+        let i = self.info()?;
+        Some(HStat { attrs: i.attrs, size: i.size, alloc: self.allocated().unwrap_or(i.size), mtime: i.mtime, links: i.links })
     }
 
     /// 實際占用的大小（稀疏、壓縮檔會比邏輯大小小）。

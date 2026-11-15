@@ -329,8 +329,8 @@ fn fail(p: &DelProgress, msg: String) {
 
 /// 刪掉一個檔案（透過已確認過的 handle）。有其他硬連結時空間不會真的釋放，不計入；
 /// 稀疏、壓縮檔只算實際占用的大小。
-fn delete_handle_file(h: &win::Handle, i: &win::HInfo, p: &DelProgress) -> bool {
-    let real = h.allocated().map_or(i.size, |a| a.min(i.size));
+fn delete_handle_file(h: &win::Handle, i: &win::HStat, p: &DelProgress) -> bool {
+    let real = i.alloc.min(i.size);
     match h.delete() {
         Ok(()) => {
             if i.links <= 1 {
@@ -388,7 +388,7 @@ fn clean_dir(h: &win::Handle, dir: &Path, cut: u64, p: &DelProgress) -> bool {
     }
     let kept = AtomicBool::new(false);
     let keep = || kept.store(true, Relaxed);
-    ents.par_iter().for_each(|e| {
+    let one = |e: &win::DirEnt| {
         if p.cancel.load(Relaxed) {
             keep();
             return;
@@ -403,7 +403,7 @@ fn clean_dir(h: &win::Handle, dir: &Path, cut: u64, p: &DelProgress) -> bool {
             keep();
             return;
         }
-        let path = dir.join(&e.name);
+        let path = if is_dir { dir.join(&e.name) } else { PathBuf::new() };
         if is_dir && protected_child(&path) {
             p.log(format!("⛔ 受保護的位置，已略過：{}", path.display()));
             keep();
@@ -429,7 +429,7 @@ fn clean_dir(h: &win::Handle, dir: &Path, cut: u64, p: &DelProgress) -> bool {
                 return;
             }
         };
-        let Some(i) = child.info() else {
+        let Some(i) = child.stat() else {
             p.failed.fetch_add(1, Relaxed);
             keep();
             return;
@@ -483,7 +483,9 @@ fn clean_dir(h: &win::Handle, dir: &Path, cut: u64, p: &DelProgress) -> bool {
         } else if i.mtime > cut || !delete_handle_file(&child, &i, p) {
             keep();
         }
-    });
+    };
+    // 同一個資料夾裡的項目也平行刪：實測（--bench-delete）比依序刪快，和分組刪差不多
+    ents.par_iter().for_each(one);
     kept.load(Relaxed)
 }
 
@@ -503,7 +505,7 @@ pub fn delete_dir(dir: &Path, p: &DelProgress) -> bool {
             return false;
         }
     };
-    let Some(i) = h.info() else {
+    let Some(i) = h.stat() else {
         p.failed.fetch_add(1, Relaxed);
         return false;
     };
@@ -553,7 +555,7 @@ pub fn delete_file(path: &Path, cut: u64, p: &DelProgress) -> bool {
             return false;
         }
     };
-    let Some(i) = h.info() else {
+    let Some(i) = h.stat() else {
         p.failed.fetch_add(1, Relaxed);
         return false;
     };

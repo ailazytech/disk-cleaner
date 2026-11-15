@@ -115,6 +115,7 @@ disk-cleaner.exe D:\Projects                   開啟並直接分析該資料夾
 disk-cleaner.exe --rules                       列出各清理規則可釋放的大小（不刪除）
 disk-cleaner.exe --projects C:\Users\me D:\    搜尋專案建置產物與 AI 模型（不刪除）
 disk-cleaner.exe --bench C:\ [cache]           掃描效能測試
+disk-cleaner.exe --bench-delete [N] [flat]     刪除速度測試（只刪它自己在暫存資料夾造出來的檔案）
 disk-cleaner.exe --selftest                    在暫存資料夾做安全性自我測試
 ```
 

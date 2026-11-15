@@ -12,14 +12,6 @@ pub use crate::theme::{ACCENT, DIM, GREEN, ORANGE, RED};
 use crate::theme::{self, AGE_W, SIZE_W, TEXT};
 use crate::{fmt, suggest, win};
 
-fn risk_badge(ui: &mut egui::Ui, risk: Risk) {
-    let (txt, col) = match risk {
-        Risk::Safe => ("安全", GREEN),
-        Risk::Caution => ("注意", ORANGE),
-    };
-    ui.label(RichText::new(txt).small().color(col));
-}
-
 /// 磁碟卡片（分析頁首頁用）
 pub fn drives_strip(app: &mut App, ui: &mut egui::Ui, clickable: bool) -> Option<PathBuf> {
     let mut clicked = None;
@@ -154,7 +146,7 @@ fn summary(app: &mut App, ui: &mut egui::Ui) {
                     );
                 }
                 ui.label(
-                    RichText::new("沒勾選但標著「建議」的項目，滑鼠移到「建議」上可以看為什麼可以清。「注意」項目刪了要重新下載或可能影響功能。")
+                    RichText::new("沒勾選但標著「建議」的項目，滑鼠移到「建議」上可以看為什麼可以清。「注意」項目預設不勾，滑鼠移到「注意」上可以看刪了會怎樣、什麼情況先別刪。")
                         .small()
                         .color(DIM),
                 );
@@ -295,7 +287,11 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
             let name = RichText::new(&row.rule.name).color(if can { TEXT } else { DIM });
             let a = ui.add(egui::Label::new(RichText::new(arrow).color(DIM)).sense(egui::Sense::click()));
             let n = ui.add(egui::Label::new(name).sense(egui::Sense::click())).on_hover_text(&row.rule.desc);
-            risk_badge(ui, row.rule.risk);
+            {
+                let caution = row.rule.risk == Risk::Caution;
+                let why = if caution { row.rule.caution_why().to_string() } else { row.rule.why() };
+                theme::risk_tag(ui, caution, &why);
+            }
             if locked {
                 ui.label(RichText::new("🔒 需系統管理員").small().color(ORANGE));
             }
@@ -534,8 +530,8 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
                         if ui.small_button("📂").on_hover_text("在檔案總管中顯示").clicked() {
                             win::reveal_in_explorer(&a.art.path);
                         }
-                        let col = if a.art.kind.risk == Risk::Safe { GREEN } else { ORANGE };
-                        ui.label(RichText::new(a.art.kind.label).small().color(col)).on_hover_text(a.art.kind.hint);
+                        theme::risk_tag(ui, a.art.kind.risk == Risk::Caution, a.art.kind.hint);
+                        ui.label(RichText::new(a.art.kind.label).small().color(DIM)).on_hover_text(a.art.kind.hint);
                         ui.add(egui::Label::new(RichText::new(a.art.path.to_string_lossy()).color(TEXT)).truncate())
                             .on_hover_text(format!("{}\n{} 個檔案", a.art.path.display(), fmt::count(files)));
                     },
@@ -730,50 +726,70 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
 }
 
 fn progress_modal(app: &mut App, ctx: &egui::Context) {
-    let Some(job) = &app.clean.job else { return };
+    let Some(job) = &mut app.clean.job else { return };
     let mut close = false;
+    // 版面全部固定寬高：路徑、數字怎麼變，視窗都不會跟著縮放跳動
+    const W: f32 = 640.0;
     egui::Modal::new(egui::Id::new("clean_progress")).show(ctx, |ui| {
-        ui.set_width(620.0);
-        let p = &job.prog;
-        let freed = p.freed.load(Relaxed);
-        match job.finished {
-            None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.heading("清理中…");
-                });
-            }
-            Some(s) => {
-                ui.heading(RichText::new(format!("✔ 清理完成（{s:.1} 秒）")).color(GREEN));
-            }
-        }
-        ui.add_space(6.0);
+        ui.set_width(W);
+        let p = job.prog.clone();
+        let running = job.finished.is_none();
+        let files = p.files.load(Relaxed);
         ui.horizontal(|ui| {
-            ui.label("已釋放");
-            ui.label(RichText::new(fmt::size(freed)).size(28.0).strong().color(theme::STRONG));
-            ui.label(RichText::new(format!("（預計 {}）", fmt::size(job.planned))).color(DIM));
+            job.anim.ui(ui, egui::vec2(230.0, 150.0), files, running);
+            ui.vertical(|ui| {
+                ui.set_width(W - 250.0);
+                ui.add_space(8.0);
+                match job.finished {
+                    None => ui.heading("清理中…"),
+                    Some(s) => ui.heading(RichText::new(format!("清理完成（{s:.1} 秒）")).color(GREEN)),
+                };
+                ui.add_space(4.0);
+                // 數字用動畫滾動，不要一格一格跳
+                let freed = p.freed.load(Relaxed) as f32;
+                let shown = ctx.animate_value_with_time(egui::Id::new("freed_roll"), freed, 0.35);
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("已釋放").color(DIM));
+                    ui.label(RichText::new(fmt::size(shown.max(0.0) as u64)).size(28.0).strong().color(theme::STRONG));
+                });
+                ui.label(RichText::new(format!("預計 {}", fmt::size(job.planned))).small().color(DIM));
+                ui.add_space(4.0);
+                let steps = p.steps.load(Relaxed).max(1);
+                let step = p.step.load(Relaxed);
+                let frac = ctx.animate_value_with_time(egui::Id::new("clean_frac"), step as f32 / steps as f32, 0.4);
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(frac).fill(theme::BLUE).desired_width(ui.available_width() - 64.0).desired_height(10.0));
+                    ui.label(RichText::new(format!("{}／{steps}", step.min(steps))).small().color(DIM));
+                });
+                let failed = match p.failed.load(Relaxed) {
+                    0 => String::new(),
+                    f => format!("，{f} 個略過"),
+                };
+                ui.add(egui::Label::new(RichText::new(format!("已刪除 {} 個檔案{failed}", fmt::count(files))).color(TEXT)).truncate())
+                    .on_hover_text("略過的是使用中、沒有權限，或為了安全不刪的項目；詳細原因在下面的紀錄裡");
+            });
         });
-        let steps = p.steps.load(Relaxed).max(1);
-        let step = p.step.load(Relaxed);
-        ui.add(egui::ProgressBar::new(step as f32 / steps as f32).fill(theme::BLUE).text(format!("{step}／{steps}")));
-        ui.label(format!(
-            "已刪除 {} 個檔案{}",
-            fmt::count(p.files.load(Relaxed)),
-            match p.failed.load(Relaxed) {
-                0 => String::new(),
-                f => format!("，{f} 個使用中或無權限已略過"),
-            }
-        ));
-        if job.finished.is_none() {
-            ui.label(RichText::new(p.current.lock().clone()).small().color(DIM));
-        }
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
-            for l in p.log.lock().iter() {
-                ui.label(RichText::new(l).small());
-            }
+        // 目前處理的位置：固定一行，太長就省略中間
+        let cur = if running { crate::anim::elide_middle(&p.current.lock(), 78) } else { "全部完成".to_string() };
+        ui.allocate_ui_with_layout(egui::vec2(W, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(cur).small().color(DIM)).truncate());
+        });
+        ui.add_space(4.0);
+        egui::Frame::NONE.fill(theme::with_alpha(theme::MIST, 90)).corner_radius(8).inner_margin(8).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .min_scrolled_height(170.0)
+                .max_height(170.0)
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for l in p.log.lock().iter() {
+                        ui.add(egui::Label::new(RichText::new(l).small()).truncate()).on_hover_text(l);
+                    }
+                });
         });
         ui.add_space(8.0);
+        let p = &job.prog;
+        let job = &*job;
         ui.horizontal(|ui| {
             if job.finished.is_none() {
                 if ui.button("⏹ 停止").clicked() {

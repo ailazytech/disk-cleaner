@@ -282,6 +282,24 @@ pub fn suggest_slot(ui: &mut egui::Ui, show: bool, why: &str) {
     });
 }
 
+/// 「安全／注意」小標籤。滑鼠移上去說明為什麼安全、或要注意什麼。
+pub fn risk_tag(ui: &mut egui::Ui, caution: bool, why: &str) {
+    let (txt, fg, bg, bg_hot, line) = if caution {
+        ("注意", Color32::from_rgb(214, 128, 52), Color32::from_rgb(255, 243, 230), Color32::from_rgb(255, 232, 208), Color32::from_rgb(246, 210, 172))
+    } else {
+        ("安全", Color32::from_rgb(64, 160, 110), Color32::from_rgb(232, 247, 238), Color32::from_rgb(214, 241, 225), Color32::from_rgb(190, 228, 206))
+    };
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(36.0, 19.0), Sense::hover());
+    let hot = resp.hovered();
+    ui.painter().rect(r, 10, if hot { bg_hot } else { bg }, Stroke::new(1.0, if hot { with_alpha(fg, 160) } else { line }), egui::StrokeKind::Inside);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(11.5), fg);
+    resp.on_hover_ui(|ui| {
+        ui.set_max_width(360.0);
+        ui.label(egui::RichText::new(if caution { "要注意的地方" } else { "為什麼安全" }).strong().color(fg));
+        ui.label(why);
+    });
+}
+
 /// 使用率長條（霧面、圓角、上緣微亮）
 pub fn usage_bar(ui: &mut egui::Ui, frac: f32, width: f32, height: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());

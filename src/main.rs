@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod cache;
 mod cleaner;
@@ -59,6 +60,69 @@ fn bench(path: &str, prefer_cache: bool) {
 }
 
 /// --rules：列出每條清理規則可釋放的大小（不刪除）
+/// 刪除速度測試：在暫存資料夾造一棵像 node_modules 的樹，用不同執行緒數刪掉它。
+/// 只會建立、刪除 %TEMP%\dc_bench_delete 底下自己造出來的檔案。
+fn bench_delete(args: &[String]) {
+    use rayon::prelude::*;
+    let total: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let flat = args.iter().any(|a| a == "flat");
+    let base = std::env::temp_dir().join("dc_bench_delete");
+    let make = || -> std::path::PathBuf {
+        let root = base.join("tree");
+        let _ = std::fs::remove_dir_all(&base);
+        // 樹狀：20 個套件 × 10 個子資料夾 × N 個檔案；flat：全部放在同一個資料夾（像 Temp）。大小 0.5～4 KB
+        let dirs = if flat { 1 } else { 200 };
+        let per = (total / dirs).max(1);
+        (0..dirs).into_par_iter().for_each(|d| {
+            let dir = if flat { root.clone() } else { root.join(format!("pkg{:02}", d / 10)).join(format!("lib{}", d % 10)) };
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..per {
+                let n = 512 + (d * 131 + f * 977) % 3584;
+                std::fs::write(dir.join(format!("m{f:04}.js")), vec![b'x'; n]).unwrap();
+            }
+        });
+        root
+    };
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    println!("每輪 {total} 個檔案（{}）；CPU 邏輯核心 {logical}", if flat { "全在同一個資料夾" } else { "樹狀" });
+    let mut runs: Vec<(String, usize)> = vec![("預設（rayon 全域）".into(), 0)];
+    let quick = args.iter().any(|a| a == "quick");
+    for t in [logical / 2, logical, logical * 2, logical * 4] {
+        if t >= 1 && !quick {
+            runs.push((format!("{t} 執行緒"), t));
+        }
+    }
+    for (label, threads) in runs {
+        let t0 = std::time::Instant::now();
+        let root = make();
+        let made = t0.elapsed().as_secs_f64();
+        let p = cleaner::DelProgress::default();
+        let t1 = std::time::Instant::now();
+        let ok = if threads == 0 {
+            cleaner::delete_dir(&root, &p)
+        } else {
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| cleaner::delete_dir(&root, &p))
+        };
+        let secs = t1.elapsed().as_secs_f64();
+        let files = p.files.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "{label:<14} 刪除 {files} 個檔案 {secs:6.2}s（{:>7.0} 個/秒）{}；建立花 {made:.1}s",
+            files as f64 / secs,
+            if ok { "" } else { " ⚠ 沒刪乾淨" }
+        );
+    }
+    if quick {
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+    // 參考：Rust 標準函式庫的 remove_dir_all（單執行緒）
+    let root = make();
+    let t1 = std::time::Instant::now();
+    let _ = std::fs::remove_dir_all(&root);
+    println!("{:<14} {:6.2}s", "std remove_dir_all", t1.elapsed().as_secs_f64());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 fn bench_rules() {
     let t = std::time::Instant::now();
     let rules = rules::catalog();
@@ -529,6 +593,10 @@ fn main() {
             bench_rules();
             return;
         }
+        Some("--bench-delete") => {
+            bench_delete(&args[2..]);
+            return;
+        }
         Some("--projects") if args.len() >= 3 => {
             bench_projects(&args[2..]);
             return;
@@ -537,6 +605,7 @@ fn main() {
     }
     // --tab dash|clean|analyze：指定開啟的分頁（截圖用）
     let tab = args.iter().position(|a| a == "--tab").and_then(|i| args.get(i + 1)).cloned();
+    let demo_clean = args.iter().any(|a| a == "--demo-clean");
     // --analyze <路徑> 或直接給路徑：啟動後馬上分析
     let analyze = match args.get(1).map(|s| s.as_str()) {
         Some("--analyze") => args.get(2).map(std::path::PathBuf::from),
@@ -561,6 +630,11 @@ fn main() {
                 Some("analyze") => a.tab = app::Tab::Analyze,
                 Some("dash") => a.tab = app::Tab::Dash,
                 _ => {}
+            }
+            // --demo-clean：只模擬清理進度（截圖、看動畫用），不會刪任何東西
+            if demo_clean {
+                a.tab = app::Tab::Clean;
+                a.start_demo_clean(&cc.egui_ctx);
             }
             Ok(Box::new(a))
         }));
