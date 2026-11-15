@@ -1,0 +1,30 @@
+[package]
+name = "disk-cleaner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Fast Windows disk analyzer and cleaner: treemap, dev caches, project build artifacts and AI models"
+license = "MIT"
+repository = "https://github.com/ailazytech/disk-cleaner"
+readme = "README.md"
+keywords = ["disk-usage", "cleaner", "treemap", "ntfs", "windows"]
+categories = ["filesystem", "gui"]
+
+[dependencies]
+crossbeam-channel = "0.5.17"
+eframe = "0.35"
+egui_extras = "0.35"
+lz4_flex = "0.14"
+parking_lot = "0.12"
+rayon = "1.12.0"
+rfd = "0.18"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_Globalization", "Win32_System_Com"] }
+
+[dev-dependencies]
+tiny-skia = "0.11"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+strip = true

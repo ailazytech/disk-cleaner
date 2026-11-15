@@ -1,0 +1,753 @@
+//! 應用程式外框：狀態、背景工作、上方工具列。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::time::{Duration, Instant};
+
+use eframe::egui::{self, Color32, RichText};
+use parking_lot::Mutex;
+
+use crate::cleaner::{self, DelProgress, Found, Measured};
+use crate::index::{self, Origin, ScanOutput};
+use crate::models::Model;
+use crate::projects::{Artifact, FindProgress};
+use crate::rules::{self, Risk, Rule};
+use crate::scan::Progress;
+use crate::settings::Settings;
+use crate::tree::{Kind, Stats, Tree};
+use crate::treemap::Tile;
+use crate::win::{self, DriveInfo};
+use crate::{fmt, ui_analyze, ui_clean};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Clean,
+    Analyze,
+}
+
+// ---------------------------------------------------------------------------
+// 清理頁狀態
+
+pub struct RuleRow {
+    pub rule: Rule,
+    pub measured: Option<Measured>,
+    pub checked: bool,
+    pub expanded: bool,
+}
+
+impl RuleRow {
+    pub fn bytes(&self) -> u64 {
+        self.measured.as_ref().map(|m| m.bytes).unwrap_or(0)
+    }
+    pub fn is_command(&self) -> bool {
+        matches!(self.rule.action, rules::Action::Command { .. })
+    }
+}
+
+pub struct MeasureJob {
+    pub cancel: Arc<AtomicBool>,
+    pub results: Arc<Mutex<Vec<(usize, Measured)>>>,
+    pub remaining: Arc<AtomicUsize>,
+    pub total: usize,
+    pub started: Instant,
+}
+
+pub struct ArtRow {
+    pub art: Artifact,
+    pub checked: bool,
+}
+
+pub struct ModelRow {
+    pub m: Model,
+    pub checked: bool,
+}
+
+pub struct ProjState {
+    pub new_root: String,
+    pub find: Option<Arc<FindProgress>>,
+    pub started: Instant,
+    pub secs: Option<f32>,
+    pub items: Vec<ArtRow>,
+    pub models: Vec<ModelRow>,
+    pub searched: bool,
+    /// 目前顯示的是快取的上次結果（秒數）
+    pub cached_age: Option<u64>,
+}
+
+pub struct CleanJob {
+    pub prog: Arc<DelProgress>,
+    pub done: Arc<AtomicBool>,
+    pub started: Instant,
+    pub planned: u64,
+    pub rule_idx: Vec<usize>,
+    pub finished: Option<f32>,
+}
+
+pub struct CleanState {
+    pub rows: Vec<RuleRow>,
+    pub measure: Option<MeasureJob>,
+    pub measure_secs: Option<f32>,
+    /// 目前顯示的是快取的上次結果（秒數）
+    pub cached_age: Option<u64>,
+    pub proj: ProjState,
+    pub job: Option<CleanJob>,
+    pub confirm: bool,
+}
+
+// ---------------------------------------------------------------------------
+// 分析頁狀態
+
+pub struct ScanJob {
+    pub prog: Arc<Progress>,
+    pub rx: crossbeam_channel::Receiver<Result<ScanOutput, String>>,
+    pub started: Instant,
+    pub target: PathBuf,
+}
+
+pub struct Loaded {
+    pub tree: Tree,
+    pub origin: Origin,
+    pub secs: f32,
+    pub target: PathBuf,
+    /// 使用者要求的路徑在樹中的節點（MFT 模式下樹是整顆磁碟）
+    pub base: u32,
+    pub rev: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Folders,
+    Types,
+    Exts,
+    Largest,
+}
+
+pub struct LayoutCache {
+    pub view: u32,
+    pub rect: egui::Rect,
+    pub rev: u64,
+    pub tiles: Vec<Tile>,
+}
+
+pub struct DelRequest {
+    pub node: u32,
+    pub path: PathBuf,
+    pub size: u64,
+    pub permanent: bool,
+}
+
+pub struct DelJob {
+    pub node: u32,
+    pub path: PathBuf,
+    pub done: Arc<AtomicBool>,
+    pub prog: Arc<DelProgress>,
+}
+
+pub struct AnalyzeState {
+    pub path_input: String,
+    pub job: Option<ScanJob>,
+    pub data: Option<Loaded>,
+    pub view: u32,
+    pub history: Vec<u32>,
+    pub selected: Option<u32>,
+    pub hovered: Option<u32>,
+    pub side: Side,
+    pub kind_focus: Option<Kind>,
+    pub layout: Option<LayoutCache>,
+    pub stats: Option<(u32, u64, Stats)>,
+    /// 目前檢視資料夾的子項目（依大小排序）
+    pub kids: Option<(u32, u64, Vec<u32>)>,
+    pub del: Option<DelRequest>,
+    pub del_job: Option<DelJob>,
+    pub error: Option<String>,
+    pub message: Option<String>,
+}
+
+pub struct App {
+    pub logo: egui::TextureHandle,
+    pub tab: Tab,
+    pub elevated: bool,
+    pub drives: Vec<DriveInfo>,
+    pub drives_at: Instant,
+    pub settings: Settings,
+    pub clean: CleanState,
+    pub an: AnalyzeState,
+}
+
+// ---------------------------------------------------------------------------
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let candidates = [
+        ("msjh", r"C:\Windows\Fonts\msjh.ttc"),
+        ("msjh", r"C:\Windows\Fonts\msjh.ttf"),
+        ("noto_tc", r"C:\Windows\Fonts\NotoSansTC-VF.ttf"),
+        ("mingliu", r"C:\Windows\Fonts\mingliu.ttc"),
+        ("msyh", r"C:\Windows\Fonts\msyh.ttc"),
+    ];
+    for (name, path) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                f.insert(0, name.into());
+            }
+            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                f.push(name.into());
+            }
+            break;
+        }
+    }
+    // 符號與 emoji 的備援字型（正黑體沒有 ▸、🧹 這類字形）
+    for (name, path) in [("segoe_sym", r"C:\Windows\Fonts\seguisym.ttf"), ("segoe_emoji", r"C:\Windows\Fonts\seguiemj.ttf")] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(f) = fonts.families.get_mut(&fam) {
+                    f.push(name.into());
+                }
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn setup_style(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 4.0);
+        s.interaction.tooltip_delay = 0.25;
+        for (ts, f) in s.text_styles.iter_mut() {
+            match ts {
+                egui::TextStyle::Body | egui::TextStyle::Button => f.size = 14.5,
+                egui::TextStyle::Small => f.size = 12.0,
+                egui::TextStyle::Heading => f.size = 20.0,
+                egui::TextStyle::Monospace => f.size = 13.5,
+                _ => {}
+            }
+        }
+    });
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, analyze: Option<PathBuf>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        setup_style(&cc.egui_ctx);
+        let settings = Settings::load();
+        let rows = rules::catalog()
+            .into_iter()
+            .map(|rule| RuleRow { rule, measured: None, checked: false, expanded: false })
+            .collect();
+        let logo = cc.egui_ctx.load_texture(
+            "logo",
+            egui::ColorImage::from_rgba_unmultiplied([128, 128], include_bytes!("../assets/icon-128.rgba")),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = App {
+            logo,
+            tab: Tab::Clean,
+            elevated: win::is_elevated(),
+            drives: win::drives(),
+            drives_at: Instant::now(),
+            settings,
+            clean: CleanState {
+                rows,
+                measure: None,
+                measure_secs: None,
+                cached_age: None,
+                proj: ProjState {
+                    new_root: String::new(),
+                    find: None,
+                    started: Instant::now(),
+                    secs: None,
+                    items: Vec::new(),
+                    models: Vec::new(),
+                    searched: false,
+                    cached_age: None,
+                },
+                job: None,
+                confirm: false,
+            },
+            an: AnalyzeState {
+                path_input: String::new(),
+                job: None,
+                data: None,
+                view: 0,
+                history: Vec::new(),
+                selected: None,
+                hovered: None,
+                side: Side::Folders,
+                kind_focus: None,
+                layout: None,
+                stats: None,
+                kids: None,
+                del: None,
+                del_job: None,
+                error: None,
+                message: None,
+            },
+        };
+        app.load_result_caches();
+        app.start_measure(&cc.egui_ctx, None);
+        if let Some(p) = analyze {
+            app.start_scan(&cc.egui_ctx, p, true);
+        }
+        app
+    }
+
+    pub fn refresh_drives(&mut self) {
+        self.drives = win::drives();
+        self.drives_at = Instant::now();
+    }
+
+    // ---------------- 規則大小計算 ----------------
+
+    /// only=None 表示全部重新計算
+    pub fn start_measure(&mut self, ctx: &egui::Context, only: Option<Vec<usize>>) {
+        if let Some(j) = &self.clean.measure {
+            j.cancel.store(true, Relaxed);
+        }
+        let idx: Vec<usize> = only.unwrap_or_else(|| (0..self.clean.rows.len()).collect());
+        let rules: Vec<Rule> = idx.iter().map(|&i| self.clean.rows[i].rule.clone()).collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let remaining = Arc::new(AtomicUsize::new(rules.len()));
+        self.clean.measure = Some(MeasureJob {
+            cancel: cancel.clone(),
+            results: results.clone(),
+            remaining: remaining.clone(),
+            total: rules.len(),
+            started: Instant::now(),
+        });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            cleaner::measure_all(&rules, &cancel, |i, m| {
+                results.lock().push((idx[i], m));
+                remaining.fetch_sub(1, Relaxed);
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    fn poll_measure(&mut self) {
+        let Some(job) = &self.clean.measure else { return };
+        let done: Vec<(usize, Measured)> = std::mem::take(&mut *job.results.lock());
+        let finished = job.remaining.load(Relaxed) == 0;
+        let secs = job.started.elapsed().as_secs_f32();
+        for (i, m) in done {
+            let elevated = self.elevated;
+            let row = &mut self.clean.rows[i];
+            let first = row.measured.is_none();
+            let has = m.bytes > 0;
+            row.measured = Some(m);
+            if first {
+                row.checked = default_checked(row, elevated);
+            }
+            if !has && !matches!(row.rule.action, rules::Action::Command { .. }) {
+                row.checked = false;
+            }
+        }
+        if finished {
+            self.clean.measure = None;
+            self.clean.measure_secs = Some(secs);
+            self.clean.cached_age = None;
+            let all: Vec<(&str, &Measured)> =
+                self.clean.rows.iter().filter_map(|r| r.measured.as_ref().map(|m| (r.rule.id, m))).collect();
+            crate::results_cache::save_rules(&all);
+        }
+    }
+
+    fn load_result_caches(&mut self) {
+        if let Some((map, age)) = crate::results_cache::load_rules() {
+            let elevated = self.elevated;
+            for row in &mut self.clean.rows {
+                if let Some(m) = map.get(row.rule.id) {
+                    row.measured = Some(m.clone());
+                    row.checked = default_checked(row, elevated);
+                }
+            }
+            self.clean.cached_age = Some(age);
+        }
+        if let Some((arts, models, age)) = crate::results_cache::load_projects() {
+            self.clean.proj.models = models.into_iter().map(|m| ModelRow { m, checked: false }).collect();
+            let week_ago = win::now_filetime().saturating_sub(7 * win::FILETIME_DAY);
+            self.clean.proj.items = arts
+                .into_iter()
+                .map(|art| {
+                    let checked = art.kind.risk == Risk::Safe && art.newest < week_ago;
+                    ArtRow { art, checked }
+                })
+                .collect();
+            self.clean.proj.items.sort_by(|a, b| b.art.bytes.cmp(&a.art.bytes));
+            self.clean.proj.searched = true;
+            self.clean.proj.cached_age = Some(age);
+        }
+    }
+
+    fn save_projects(&self) {
+        let v: Vec<&Artifact> = self.clean.proj.items.iter().map(|a| &a.art).collect();
+        let m: Vec<&Model> = self.clean.proj.models.iter().map(|r| &r.m).collect();
+        crate::results_cache::save_projects(&v, &m);
+    }
+
+    // ---------------- 專案產物搜尋 ----------------
+
+    pub fn start_find(&mut self, ctx: &egui::Context) {
+        if let Some(f) = &self.clean.proj.find {
+            f.cancel.store(true, Relaxed);
+        }
+        let prog = Arc::new(FindProgress::default());
+        self.clean.proj.find = Some(prog.clone());
+        self.clean.proj.started = Instant::now();
+        self.clean.proj.items.clear();
+        self.clean.proj.models.clear();
+        self.clean.proj.searched = true;
+        self.clean.proj.secs = None;
+        let roots = self.settings.roots.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            crate::projects::find(&roots, &prog);
+            prog.pending.store(u64::MAX, Relaxed); // 標記完成
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_find(&mut self) {
+        let Some(f) = &self.clean.proj.find else { return };
+        let new: Vec<Artifact> = std::mem::take(&mut *f.results.lock());
+        let finished = f.pending.load(Relaxed) == u64::MAX;
+        let week_ago = win::now_filetime().saturating_sub(7 * win::FILETIME_DAY);
+        for art in new {
+            let checked = art.kind.risk == Risk::Safe && art.newest < week_ago;
+            self.clean.proj.items.push(ArtRow { art, checked });
+        }
+        self.clean.proj.items.sort_by(|a, b| b.art.bytes.cmp(&a.art.bytes));
+        let new_models: Vec<Model> = std::mem::take(&mut *f.models.lock());
+        if !new_models.is_empty() {
+            let checked: std::collections::HashSet<PathBuf> =
+                self.clean.proj.models.iter().filter(|r| r.checked).map(|r| r.m.path.clone()).collect();
+            let mut all: Vec<Model> = self.clean.proj.models.drain(..).map(|r| r.m).collect();
+            all.extend(new_models);
+            crate::models::dedup(&mut all);
+            all.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+            self.clean.proj.models =
+                all.into_iter().map(|m| ModelRow { checked: checked.contains(&m.path), m }).collect();
+        }
+        if finished {
+            self.clean.proj.secs = Some(self.clean.proj.started.elapsed().as_secs_f32());
+            self.clean.proj.find = None;
+            self.clean.proj.cached_age = None;
+            self.save_projects();
+        }
+    }
+
+    // ---------------- 清理 ----------------
+
+    pub fn selected_bytes(&self) -> (u64, usize) {
+        let mut b = 0;
+        let mut n = 0;
+        for r in &self.clean.rows {
+            if r.checked {
+                b += r.bytes();
+                n += 1;
+            }
+        }
+        for a in &self.clean.proj.items {
+            if a.checked {
+                b += a.art.bytes;
+                n += 1;
+            }
+        }
+        for m in &self.clean.proj.models {
+            if m.checked {
+                b += m.m.bytes;
+                n += 1;
+            }
+        }
+        (b, n)
+    }
+
+    pub fn start_clean(&mut self, ctx: &egui::Context) {
+        let prog = Arc::new(DelProgress::default());
+        let done = Arc::new(AtomicBool::new(false));
+        let mut plan: Vec<(Rule, Vec<Found>)> = Vec::new();
+        let mut rule_idx = Vec::new();
+        for (i, r) in self.clean.rows.iter().enumerate() {
+            if r.checked && (!r.rule.admin || self.elevated) {
+                let found = r.measured.as_ref().map(|m| m.found.clone()).unwrap_or_default();
+                plan.push((r.rule.clone(), found));
+                rule_idx.push(i);
+            }
+        }
+        let arts: Vec<PathBuf> =
+            self.clean.proj.items.iter().filter(|a| a.checked).map(|a| a.art.path.clone()).collect();
+        let models: Vec<Model> = self.clean.proj.models.iter().filter(|m| m.checked).map(|m| m.m.clone()).collect();
+        let (planned, _) = self.selected_bytes();
+        prog.steps.store((plan.len() + arts.len() + models.len()) as u64, Relaxed);
+        self.clean.job = Some(CleanJob {
+            prog: prog.clone(),
+            done: done.clone(),
+            started: Instant::now(),
+            planned,
+            rule_idx,
+            finished: None,
+        });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            com_init();
+            // 指令類（DISM 等）放最後
+            plan.sort_by_key(|(r, _)| matches!(r.action, rules::Action::Command { .. }));
+            for (rule, found) in &plan {
+                if prog.cancel.load(Relaxed) {
+                    break;
+                }
+                *prog.current.lock() = rule.name.clone();
+                cleaner::clean_rule(rule, found, &prog);
+                prog.step.fetch_add(1, Relaxed);
+                ctx.request_repaint();
+            }
+            for a in &arts {
+                if prog.cancel.load(Relaxed) {
+                    break;
+                }
+                let before = prog.freed.load(Relaxed);
+                let ok = cleaner::delete_dir(a, &prog);
+                let freed = prog.freed.load(Relaxed) - before;
+                prog.log(format!(
+                    "{} {}：釋放 {}",
+                    if ok { "✔" } else { "⚠" },
+                    a.display(),
+                    fmt::size(freed)
+                ));
+                prog.step.fetch_add(1, Relaxed);
+                ctx.request_repaint();
+            }
+            for m in &models {
+                if prog.cancel.load(Relaxed) {
+                    break;
+                }
+                *prog.current.lock() = m.name.clone();
+                let before = prog.freed.load(Relaxed);
+                let ok = match m.del {
+                    crate::models::ModelDel::Dir => cleaner::delete_dir(&m.path, &prog),
+                    crate::models::ModelDel::File => cleaner::delete_file(&m.path, &prog),
+                    crate::models::ModelDel::Ollama => match crate::models::delete_ollama(&m.path) {
+                        Ok(freed) => {
+                            prog.freed.fetch_add(freed, Relaxed);
+                            true
+                        }
+                        Err(e) => {
+                            prog.log(format!("   ⚠ {e}"));
+                            false
+                        }
+                    },
+                };
+                let freed = prog.freed.load(Relaxed) - before;
+                prog.log(format!("{} 模型 {}（{}）：釋放 {}", if ok { "✔" } else { "⚠" }, m.name, m.source, fmt::size(freed)));
+                prog.step.fetch_add(1, Relaxed);
+                ctx.request_repaint();
+            }
+            done.store(true, Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_clean(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.clean.job else { return };
+        if job.finished.is_none() && job.done.load(Relaxed) {
+            job.finished = Some(job.started.elapsed().as_secs_f32());
+            let idx = job.rule_idx.clone();
+            // 移除已刪掉的專案產物
+            self.clean.proj.items.retain(|a| !(a.checked && !a.art.path.exists()));
+            for a in &mut self.clean.proj.items {
+                a.checked = false;
+            }
+            self.clean.proj.models.retain(|m| m.m.path.exists());
+            for m in &mut self.clean.proj.models {
+                m.checked = false;
+            }
+            self.save_projects();
+            self.refresh_drives();
+            self.start_measure(ctx, Some(idx));
+        }
+    }
+
+    // ---------------- 磁碟分析 ----------------
+
+    pub fn start_scan(&mut self, ctx: &egui::Context, target: PathBuf, prefer_cache: bool) {
+        if let Some(j) = &self.an.job {
+            j.prog.cancel.store(true, Relaxed);
+        }
+        let prog = Arc::new(Progress::default());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.an.job = Some(ScanJob { prog: prog.clone(), rx, started: Instant::now(), target: target.clone() });
+        self.an.error = None;
+        self.an.path_input = target.to_string_lossy().into_owned();
+        let ctx2 = ctx.clone();
+        std::thread::spawn(move || {
+            let r = index::run(&target, &prog, prefer_cache);
+            let _ = tx.send(r);
+            ctx2.request_repaint();
+        });
+        self.tab = Tab::Analyze;
+    }
+
+    fn poll_scan(&mut self) {
+        let Some(job) = &self.an.job else { return };
+        let Ok(res) = job.rx.try_recv() else { return };
+        self.an.job = None;
+        match res {
+            Ok(out) => {
+                let rev = self.an.data.as_ref().map(|d| d.rev + 1).unwrap_or(1);
+                self.an.view = out.view;
+                self.an.history.clear();
+                self.an.selected = None;
+                self.an.layout = None;
+                self.an.stats = None;
+                self.an.kind_focus = None;
+                self.an.data = Some(Loaded { tree: out.tree, origin: out.origin, secs: out.secs, target: out.target, base: out.view, rev });
+            }
+            Err(e) => self.an.error = Some(e),
+        }
+    }
+
+    fn poll_del(&mut self) {
+        let Some(job) = &self.an.del_job else { return };
+        if !job.done.load(Relaxed) {
+            return;
+        }
+        let job = self.an.del_job.take().unwrap();
+        if let Some(d) = &mut self.an.data {
+            if !job.path.exists() {
+                d.tree.mark_deleted(job.node);
+                d.rev += 1;
+                self.an.message = Some(format!("已刪除 {}", job.path.display()));
+            } else {
+                let failed = job.prog.failed.load(Relaxed);
+                self.an.message = Some(format!(
+                    "部分檔案無法刪除（{failed} 個使用中或無權限），已釋放 {}。建議重新掃描。",
+                    fmt::size(job.prog.freed.load(Relaxed))
+                ));
+            }
+            if self.an.selected == Some(job.node) {
+                self.an.selected = None;
+            }
+        }
+        self.refresh_drives();
+    }
+
+    pub fn start_delete(&mut self, ctx: &egui::Context, req: DelRequest) {
+        let prog = Arc::new(DelProgress::default());
+        let done = Arc::new(AtomicBool::new(false));
+        self.an.del_job = Some(DelJob { node: req.node, path: req.path.clone(), done: done.clone(), prog: prog.clone() });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            com_init();
+            if req.permanent {
+                if req.path.is_dir() {
+                    cleaner::delete_dir(&req.path, &prog);
+                } else {
+                    cleaner::delete_file(&req.path, &prog);
+                }
+            } else if cleaner::is_protected(&req.path) {
+                prog.log("受保護的位置");
+            } else {
+                win::move_to_recycle_bin(std::slice::from_ref(&req.path));
+            }
+            done.store(true, Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    pub fn busy(&self) -> bool {
+        self.clean.measure.is_some()
+            || self.clean.proj.find.is_some()
+            || self.clean.job.as_ref().is_some_and(|j| j.finished.is_none())
+            || self.an.job.is_some()
+            || self.an.del_job.is_some()
+    }
+
+    // ---------------- 上方工具列 ----------------
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.add(egui::Image::from_texture(&self.logo).fit_to_exact_size(egui::vec2(26.0, 26.0)));
+            ui.label(RichText::new("DiskCleaner").heading().strong());
+            ui.add_space(16.0);
+            let tab = |ui: &mut egui::Ui, cur: &mut Tab, t: Tab, label: &str| {
+                let sel = *cur == t;
+                let txt = RichText::new(label).size(15.5);
+                let txt = if sel { txt.strong().color(Color32::WHITE) } else { txt };
+                if ui.selectable_label(sel, txt).clicked() {
+                    *cur = t;
+                }
+            };
+            tab(ui, &mut self.tab, Tab::Clean, "  清理  ");
+            tab(ui, &mut self.tab, Tab::Analyze, "  磁碟分析  ");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.elevated {
+                    ui.label(RichText::new("🛡 系統管理員").color(Color32::from_rgb(120, 200, 120)))
+                        .on_hover_text("已啟用 MFT 極速掃描與系統項目清理");
+                } else if ui
+                    .button("🛡 以系統管理員重新啟動")
+                    .on_hover_text("啟用 MFT 極速掃描（整顆磁碟數秒）與系統項目（Windows Update、系統暫存…）清理")
+                    .clicked()
+                    && win::relaunch_as_admin()
+                {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
+    }
+}
+
+pub fn com_init() {
+    use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_measure();
+        self.poll_find();
+        self.poll_clean(&ctx);
+        self.poll_scan();
+        self.poll_del();
+        if self.drives_at.elapsed() > Duration::from_secs(20) {
+            self.refresh_drives();
+        }
+
+        // 拖放資料夾 → 分析
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if let Some(p) = dropped.into_iter().next() {
+            let p = if p.is_dir() { p } else { p.parent().map(|x| x.to_path_buf()).unwrap_or(p) };
+            self.start_scan(&ctx, p, true);
+        }
+
+        egui::Panel::top("top")
+            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(8, 8)))
+            .show(ui, |ui| self.top_bar(ui));
+
+        match self.tab {
+            Tab::Clean => ui_clean::show(self, ui),
+            Tab::Analyze => ui_analyze::show(self, ui),
+        }
+
+        if self.busy() {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+}
+
+/// 規則預設是否勾選：「安全」、有東西可清、權限足夠、不是外部指令。
+fn default_checked(row: &RuleRow, elevated: bool) -> bool {
+    row.bytes() > 0
+        && row.rule.risk == Risk::Safe
+        && (!row.rule.admin || elevated)
+        && !matches!(row.rule.action, rules::Action::Command { .. })
+}
