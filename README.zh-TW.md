@@ -4,7 +4,7 @@
 
 [English](README.md) · **繁體中文**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)](#建置) [![Rust](https://img.shields.io/badge/Rust-1.92%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org) [![CI](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ailazytech/disk-cleaner)](https://github.com/ailazytech/disk-cleaner/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)](#下載) [![Rust](https://img.shields.io/badge/Rust-1.92%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org) [![CI](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml)
 
 > **看清楚磁碟被什麼吃掉，再一次清乾淨。**
 
@@ -110,9 +110,15 @@
 
 刪除相關的程式碼在發佈前經過兩個獨立的 AI 審查（OpenAI Codex 與 Google Gemini），修正後又做了兩輪審查；找到的問題都已修正並加進自我測試。
 
+## 下載
+
+到 [Releases](https://github.com/ailazytech/disk-cleaner/releases/latest) 下載 `disk-cleaner-<版本>-windows-x64.zip`，解壓縮到任何地方，執行 `disk-cleaner.exe` 即可（Windows 10／11，64 位元）。壓縮檔是 GitHub Actions 從打了標籤的 commit 建置並跑過自我測試的，SHA-256 寫在旁邊的 `.sha256` 檔。
+
+exe 沒有程式碼簽章，第一次執行時 SmartScreen 可能會跳出警告：按 **其他資訊 → 仍要執行**。
+
 ## 建置
 
-目前還沒有預先編譯好的版本。需要 Rust 1.92 以上與 MSVC 工具鏈：
+需要 Rust 1.92 以上與 MSVC 工具鏈：
 
 ```
 git clone https://github.com/ailazytech/disk-cleaner

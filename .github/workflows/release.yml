@@ -1,0 +1,47 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching Cargo.toml) to build, self-test and
+# attach the zip to a draft release; publish the draft after checking it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Safety self-test
+        run: cargo run --release --locked -- --selftest
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$ver" -ne $tag) { throw "tag $tag does not match Cargo.toml version $ver" }
+          $name = "disk-cleaner-$tag-windows-x64"
+          New-Item -ItemType Directory "dist/$name" | Out-Null
+          Copy-Item target/release/disk-cleaner.exe, LICENSE, README.md, README.zh-TW.md "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          Get-Content "dist/$name.zip.sha256"
+      - name: Upload to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $files = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber
+          } else {
+            gh release create $tag @files --draft --verify-tag --title "DiskCleaner $tag" --notes "Release notes coming soon."
+          }

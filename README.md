@@ -4,7 +4,7 @@
 
 **English** · [繁體中文](README.zh-TW.md)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)](#build) [![Rust](https://img.shields.io/badge/Rust-1.92%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org) [![CI](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ailazytech/disk-cleaner)](https://github.com/ailazytech/disk-cleaner/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)](#download) [![Rust](https://img.shields.io/badge/Rust-1.92%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org) [![CI](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/ailazytech/disk-cleaner/actions/workflows/ci.yml)
 
 > **See what's eating your drives — then clear it in one go.**
 
@@ -110,9 +110,15 @@ Wrongly deleting your data is the worst thing a cleaner can do, so the deletion 
 
 The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes went through two more review rounds; the issues found are fixed and covered by the self-test.
 
+## Download
+
+Get `disk-cleaner-<version>-windows-x64.zip` from [Releases](https://github.com/ailazytech/disk-cleaner/releases/latest), unzip it anywhere and run `disk-cleaner.exe` (Windows 10 / 11, 64-bit). The zip is built and self-tested by GitHub Actions from the tagged commit; its SHA-256 is in the `.sha256` file next to it.
+
+The exe is not code-signed, so SmartScreen may warn the first time you run it: click **More info → Run anyway**.
+
 ## Build
 
-There is no prebuilt release yet. You need Rust 1.92 or newer with the MSVC toolchain:
+You need Rust 1.92 or newer with the MSVC toolchain:
 
 ```
 git clone https://github.com/ailazytech/disk-cleaner
