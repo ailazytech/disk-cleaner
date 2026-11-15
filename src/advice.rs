@@ -377,16 +377,11 @@ fn is_updater(s: &str) -> bool {
 }
 
 /// 開機／登入時執行的第三方排程工作。這裡只能停用；防毒、驅動這類「保留」的不給停。
+/// 認不出來的一律「不確定」：名稱有 update 的也可能是防毒或瀏覽器的安全更新，不替使用者判斷。
 pub fn for_task(t: &crate::bootopt::SchedTask) -> Option<Advice> {
     let file = file_of(Path::new(&t.command));
     let name = t.path.rsplit('\\').next().unwrap_or(&t.path);
-    lookup(&file, name, &scrub(&t.command)).or_else(|| {
-        (is_updater(name) || is_updater(&file)).then_some(a(
-            Rec::Off,
-            "自動更新工作",
-            "只是在開機或登入時檢查更新。停用後不會自動更新，記得偶爾打開程式手動更新；瀏覽器和防毒的更新建議保留。",
-        ))
-    })
+    lookup(&file, name, &scrub(&t.command))
 }
 
 /// 設成「自動」的第三方服務。這裡唯一的動作是改成「自動（延遲開始）」，所以除了「保留」之外都標成「延後啟用」。
@@ -839,6 +834,34 @@ pub fn full_report(d: &BootData) -> String {
             if slow.len() > 30 {
                 s += &format!("（另外還有 {} 項，影響較小）\n", slow.len() - 30);
             }
+        }
+    }
+    if let crate::bootopt::TaskList::Ok(list) = &d.tasks
+        && !list.is_empty()
+    {
+        s += "\n## 開機或登入時執行的第三方排程工作\n";
+        for t in list.iter().take(40) {
+            let when = match (t.boot, t.logon) {
+                (true, true) => "開機、登入時",
+                (true, false) => "開機時",
+                _ => "登入時",
+            };
+            s += &format!("- {}：{}（{when}{}）\n", t.path, t.command, if t.enabled { "" } else { "；已停用" });
+        }
+    }
+    if let Ok(list) = &d.services
+        && !list.is_empty()
+    {
+        s += "\n## 設成「自動」啟動的第三方服務\n";
+        for v in list.iter().take(60) {
+            let mut extra = Vec::new();
+            if v.delayed {
+                extra.push("已是延遲開始".to_string());
+            }
+            if !v.company.is_empty() {
+                extra.push(format!("廠商 {}", v.company));
+            }
+            s += &format!("- {}（{}）：{}{}\n", v.display, v.name, v.exe, if extra.is_empty() { String::new() } else { format!("（{}）", extra.join("；")) });
         }
     }
     s += "\n請：\n\

@@ -135,7 +135,7 @@ fn write_value(root: HKEY, path: &str, name: &str, ty: u32, data: &[u8]) -> Resu
 }
 
 /// 展開 %VAR%（REG_EXPAND_SZ 用）
-fn expand_env(s: &str) -> String {
+pub(crate) fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(i) = rest.find('%') {
@@ -312,8 +312,10 @@ fn lnk_parse(d: &[u8]) -> Option<(PathBuf, usize, u32)> {
         return None; // 不是本機路徑（網路分享）
     }
     let info = &d[li..li + li_size];
-    let (base, suffix) = if hdr >= 0x24 {
-        (cstr_utf16(info, u32_at(info, 28)? as usize)?, cstr_utf16(info, u32_at(info, 32)? as usize)?)
+    // 標頭夠大而且真的填了 Unicode 位移（不是 0）才讀 Unicode 版本，否則讀 ANSI 版本
+    let (ub, us) = if hdr >= 0x24 { (u32_at(info, 28)? as usize, u32_at(info, 32)? as usize) } else { (0, 0) };
+    let (base, suffix) = if ub >= hdr && us >= hdr && ub > 0 {
+        (cstr_utf16(info, ub)?, cstr_utf16(info, us)?)
     } else {
         (cstr_ansi(info, u32_at(info, 16)? as usize)?, cstr_ansi(info, u32_at(info, 24)? as usize)?)
     };
@@ -370,7 +372,7 @@ fn lnk_target(p: &Path) -> Option<PathBuf> {
     if meta.len() > 1 << 20 {
         return None;
     }
-    lnk_target_bytes(&std::fs::read(p).ok()?)
+    lnk_target_bytes(&std::fs::read(p).ok()?).map(|t| PathBuf::from(expand_env(&t.to_string_lossy())))
 }
 
 pub fn lnk_details(p: &Path) -> Option<LnkInfo> {
@@ -465,8 +467,8 @@ pub struct StartupItem {
     pub delay_ms: Option<u32>,
     /// 程式後面的參數（Run 機碼才有；給「問 AI」判斷要不要省略）
     pub args: String,
-    /// 已經改成延後啟動：（DiskCleaner 建立的排程工作, 延遲秒數）
-    pub delayed: Option<(String, u32)>,
+    /// 已經改成延後啟動：（DiskCleaner 建立的排程工作, 延遲秒數, 程式更新後指令變了、工作還是舊的）
+    pub delayed: Option<(String, u32, bool)>,
 }
 
 /// StartupApproved 的值：第一個位元組是偶數（02、06）＝啟用，奇數（03、07）＝停用；沒有這個值＝啟用。
@@ -1090,13 +1092,11 @@ pub fn run(action: Action) -> Option<(String, bool)> {
                     Err(e) => (format!("{name}：{e}"), true),
                 });
             }
-            let (ok, err) = set_enabled_many(&items, on);
-            let note = bootopt::note_toggle(&items[..ok], on).err();
-            Some(match (err, note) {
-                (None, None) => (format!("已{} {name}，下次登入生效。", if on { "啟用" } else { "停用" }), false),
-                (None, Some(e)) => (format!("已{} {name}，但沒記進優化記錄：{e}", if on { "啟用" } else { "停用" }), true),
-                (Some(e), _) if ok > 0 => (format!("{name}：{} 筆中改了 {ok} 筆，其餘失敗：{e}", items.len()), true),
-                (Some(e), _) => (format!("{name}：{e}"), true),
+            let (ok, err) = bootopt::toggle(&items, on);
+            Some(match err {
+                None => (format!("已{} {name}，下次登入生效。", if on { "啟用" } else { "停用" }), false),
+                Some(e) if ok > 0 => (format!("{name}：{} 筆中改了 {ok} 筆，其餘失敗：{e}", items.len()), true),
+                Some(e) => (format!("{name}：{e}"), true),
             })
         }
         Action::FastStartup(on) => Some(match set_fast_startup(on) {
@@ -1122,14 +1122,10 @@ pub fn run(action: Action) -> Option<(String, bool)> {
             for (items, delay) in &plan {
                 let r = match delay {
                     Some(s) => bootopt::delay(items, *s),
-                    None => {
-                        let (ok, err) = set_enabled_many(items, false);
-                        let note = bootopt::note_toggle(&items[..ok], false).err();
-                        match err.or(note) {
-                            Some(e) => Err(e),
-                            None => Ok(()),
-                        }
-                    }
+                    None => match bootopt::toggle(items, false) {
+                        (_, Some(e)) => Err(e),
+                        _ => Ok(()),
+                    },
                 };
                 match r {
                     Ok(()) if delay.is_some() => later += 1,
@@ -1145,17 +1141,23 @@ pub fn run(action: Action) -> Option<(String, bool)> {
         }
         Action::Restore(list) => {
             let now = startup_items();
-            let mut errs = Vec::new();
+            let (mut errs, mut notes) = (Vec::new(), Vec::new());
             for c in &list {
-                if let Err(e) = bootopt::restore(c, &now) {
-                    errs.push(format!("{}：{e}", c.label));
+                match bootopt::restore(c, &now) {
+                    Ok(Some(n)) => notes.push(n),
+                    Ok(None) => {}
+                    Err(e) => errs.push(format!("{}：{e}", c.label)),
                 }
             }
-            Some(if errs.is_empty() {
-                (format!("已還原 {} 項，下次登入生效。", list.len()), false)
-            } else {
-                (format!("還原 {} 項中有 {} 項失敗：{}", list.len(), errs.len(), errs.join("；")), true)
-            })
+            let done = list.len() - errs.len() - notes.len();
+            let mut m = format!("已還原 {done} 項，下次登入生效。");
+            if !notes.is_empty() {
+                m += &format!(" {}。", notes.join("；"));
+            }
+            if !errs.is_empty() {
+                m += &format!(" 失敗 {} 項：{}", errs.len(), errs.join("；"));
+            }
+            Some((m, !errs.is_empty()))
         }
         Action::TaskEnabled(t, on) => Some(match bootopt::set_task_enabled(&t, on) {
             Ok(()) => (format!("已{}排程工作 {}。", if on { "恢復" } else { "停用" }, t.path), false),
@@ -1206,11 +1208,13 @@ pub fn load() -> BootData {
     }
     // 優化記錄：延後中的項目標上它的工作與延遲；工作被別人刪掉的，記錄裡標出來（還原時只要重新啟用）
     let mut changes = Vec::new();
-    for c in bootopt::log_load_from(&bootopt::log_path()) {
-        let gone = c.kind == bootopt::ChangeKind::Delayed && !bootopt::task_exists(&c.task);
+    // （每一筆延後要問一次工作排程器：最多查 100 筆，避免記錄異常時讀很久）
+    for (n, c) in bootopt::log_load_from(&bootopt::log_path()).into_iter().enumerate() {
+        let gone = c.kind == bootopt::ChangeKind::Delayed && (n >= 100 || !bootopt::task_exists(&c.task));
         if c.kind == bootopt::ChangeKind::Delayed && !gone {
+            // 用來源＋名稱對應；程式更新後指令變了，標出來（延後的工作還是舊指令，要重建）
             for it in items.iter_mut().filter(|it| c.is_item(it)) {
-                it.delayed = Some((c.task.clone(), c.delay));
+                it.delayed = Some((c.task.clone(), c.delay, it.command != c.command));
             }
         }
         changes.push((c, gone));
@@ -1297,7 +1301,7 @@ pub fn demo() -> BootData {
     };
     // OneDrive 示範成已延後；優化記錄裡有它和一個停用的項目、一個停用的排程工作
     items[1].enabled = false;
-    items[1].delayed = Some((r"\DiskCleaner\延後啟動 OneDrive (0d1e2f3a)".into(), 120));
+    items[1].delayed = Some((r"\DiskCleaner\延後啟動 OneDrive (0d1e2f3a)".into(), 120, false));
     let ch = |kind, label: &str, target: &str, name: &str, command: &str, task: &str, delay| bootopt::Change {
         kind,
         when: now - day,
@@ -1322,6 +1326,7 @@ pub fn demo() -> BootData {
         command: command.into(),
         args: String::new(),
         author: String::new(),
+        actions: 1,
     };
     let tasks = bootopt::TaskList::Ok(vec![
         task(r"\AdobeAAMUpdater-1.0", false, true, false, r"C:\Program Files (x86)\Common Files\Adobe\OOBE\PDApp\UWA\UpdaterStartupUtility.exe"),
@@ -1349,6 +1354,8 @@ pub fn demo() -> BootData {
 /// 並確認真的刪掉了。
 pub struct TestRunValue {
     name: String,
+    data: Vec<u8>,
+    done: bool,
 }
 
 impl TestRunValue {
@@ -1360,18 +1367,36 @@ impl TestRunValue {
         }
         let data: Vec<u8> = command.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect();
         write_value(HKEY_CURRENT_USER, RUN, name, REG_SZ, &data).ok()?;
-        Some(TestRunValue { name: name.into() })
+        Some(TestRunValue { name: name.into(), data, done: false })
     }
 
-    pub fn remove(self) -> bool {
+    fn cleanup(&mut self) -> bool {
+        self.done = true;
         let approved = format!(r"{APPROVED}\Run");
-        let exists = |path: &str| open_key(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE).and_then(|k| query(&k, &self.name)).is_some();
+        let get = |path: &str| open_key(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE).and_then(|k| query(&k, &self.name));
+        // Run 值還是我們寫的內容才刪（被別人改掉就不碰）
+        if get(RUN).is_some_and(|(_, d)| d != self.data) {
+            return false;
+        }
         let del = |path: &str| {
             let p = win::wide(path);
             let n = win::wide(&self.name);
-            !exists(path) || unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, p.as_ptr(), n.as_ptr()) == 0 }
+            get(path).is_none() || unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, p.as_ptr(), n.as_ptr()) == 0 }
         };
-        del(RUN) && del(&approved) && !exists(RUN) && !exists(&approved)
+        del(RUN) && del(&approved) && get(RUN).is_none() && get(&approved).is_none()
+    }
+
+    pub fn remove(mut self) -> bool {
+        self.cleanup()
+    }
+}
+
+impl Drop for TestRunValue {
+    /// 測試中途失敗提早返回時也會清掉
+    fn drop(&mut self) {
+        if !self.done {
+            self.cleanup();
+        }
     }
 }
 

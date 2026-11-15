@@ -402,7 +402,11 @@ pub fn file_company(path: &Path) -> String {
             if VerQueryValueW(buf.as_ptr() as *const _, key.as_ptr(), &mut v, &mut len) != 0 && !v.is_null() && len > 0 {
                 let s = std::slice::from_raw_parts(v as *const u16, len as usize);
                 let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-                return String::from_utf16_lossy(&s[..end]).trim().to_string();
+                let name = String::from_utf16_lossy(&s[..end]).trim().to_string();
+                // 有的檔案第一個語系的公司名稱是空的，繼續找下一個
+                if !name.is_empty() {
+                    return name;
+                }
             }
         }
         String::new()

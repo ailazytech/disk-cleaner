@@ -36,7 +36,7 @@ fn rec_tag(ui: &mut egui::Ui, adv: Option<Advice>) {
             ui.label(RichText::new(a.what).color(TEXT).strong());
             ui.label(a.how);
             if a.rec == Rec::Later {
-                ui.label(RichText::new("這個工具不會自動幫你延後：做法是停用它的自動啟動，開機後過幾分鐘再自己打開。").small().color(c.0));
+                ui.label(RichText::new("可以按右邊的「延後」，用 Windows 的工作排程器在登入後才啟動它（只有「目前使用者」的項目能延後）。").small().color(c.0));
             }
             ui.label(RichText::new("這是依名稱和位置判斷的，拿不準時可以按「問 AI」再確認。").small().color(DIM));
         }
@@ -505,7 +505,7 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                     // 延後：已延後的是一個選單（改時間／取消），可以延後的是一個按鈕
                     let spec = bootopt::launch_spec(it);
                     ui.allocate_ui_with_layout(vec2(122.0, 22.0), Layout::right_to_left(Align::Center), |ui| match &delayed {
-                        Some((_, secs_now)) => {
+                        Some((_, secs_now, _)) => {
                             ui.add_enabled_ui(!locked, |ui| {
                                 ui.menu_button(RichText::new(format!("⏱ 登入後 {}", boot::delay_text(*secs_now))).size(12.0).color(PERI), |ui| {
                                     for s in bootopt::DELAY_CHOICES {
@@ -571,6 +571,11 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                         ui.label(RichText::new("會啟動兩次").small().color(RED)).on_hover_text(
                             "它已經設成延後啟動，但原本的開機自動啟動又被打開了（例如在工作管理員重新啟用），開機時和登入後都會各啟動一次。\
                              點右邊的延後選單取消延後，或在這裡取消勾選。",
+                        );
+                    }
+                    if delayed.as_ref().is_some_and(|d| d.2) {
+                        ui.label(RichText::new("指令已更新").small().color(ORANGE)).on_hover_text(
+                            "程式更新後，開機項目的指令變了，但延後的工作還是舊的指令。在右邊的延後選單選一個時間，就會用新的指令重建。",
                         );
                     }
                     if it.missing {
@@ -805,7 +810,8 @@ fn tasks_card(app: &mut App, ui: &mut egui::Ui) {
         match &data.tasks {
             bootopt::TaskList::NeedAdmin => {
                 ui.label(RichText::new("別的程式建立的排程工作，只有系統管理員讀得到。").color(DIM));
-                if !elevated && ui.button("🛡 以系統管理員重新啟動").clicked() {
+                // 示範模式不提供（重新啟動會變成真實模式）
+                if !elevated && !app.boot.demo && ui.button("🛡 以系統管理員重新啟動").clicked() {
                     relaunch = true;
                 }
             }
@@ -830,8 +836,18 @@ fn tasks_card(app: &mut App, ui: &mut egui::Ui) {
                             };
                             theme::right_cell(ui, 90.0, when, FontId::proportional(12.0), DIM);
                             let (label, target) = if t.enabled { ("停用", false) } else { ("恢復", true) };
-                            let r = ui.add_enabled(!busy && !keep && elevated, egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(56.0, 20.0)));
-                            let r = if !elevated { r.on_disabled_hover_text("要系統管理員權限才能修改排程工作") } else if keep { r.on_disabled_hover_text("建議保留，這裡不提供停用") } else { r };
+                            // 恢復一律可以；停用要是單純「執行一個程式」的工作，而且不是建議保留的
+                            let blocked = !target && (keep || !t.simple());
+                            let r = ui.add_enabled(!busy && !blocked && elevated, egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(56.0, 20.0)));
+                            let r = if !elevated {
+                                r.on_disabled_hover_text("要系統管理員權限才能修改排程工作")
+                            } else if keep && !target {
+                                r.on_disabled_hover_text("建議保留，這裡不提供停用")
+                            } else if !t.simple() && !target {
+                                r.on_disabled_hover_text("這個工作有多個動作（或不是執行程式的動作），停用可能連帶停掉別的功能，請在工作排程器自己確認")
+                            } else {
+                                r
+                            };
                             if r.clicked() {
                                 action = Some(Action::TaskEnabled(t.clone(), target));
                             }
