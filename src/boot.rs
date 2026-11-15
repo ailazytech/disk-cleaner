@@ -326,6 +326,17 @@ impl Source {
     pub fn needs_admin(self) -> bool {
         matches!(self, Source::MachineRun | Source::MachineRun32 | Source::CommonFolder)
     }
+    /// 登記的位置（給「問 AI」的提問用）
+    pub fn location(self) -> &'static str {
+        match self {
+            Source::UserRun => r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            Source::MachineRun => r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+            Source::MachineRun32 => r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+            Source::UserFolder => "目前使用者的「啟動」資料夾",
+            Source::CommonFolder => "所有使用者共用的「啟動」資料夾",
+            Source::StoreApp => "Microsoft Store 應用程式的啟動工作",
+        }
+    }
     fn approved(self) -> Option<(HKEY, String)> {
         Some(match self {
             Source::UserRun => (HKEY_CURRENT_USER, format!(r"{APPROVED}\Run")),
@@ -571,6 +582,11 @@ pub struct SlowItem {
     /// 啟動花的總時間（TotalTime）總和
     pub total_ms: u64,
     pub max_degr_ms: u32,
+    /// 最早、最近一次記錄的時間（FILETIME；0＝不明）
+    pub first: u64,
+    pub last: u64,
+    /// 對應到的開機自動啟動項目（`BootData::items` 的索引；只有「程式」類會對）
+    pub startup: Vec<usize>,
 }
 
 impl SlowItem {
@@ -738,7 +754,20 @@ pub fn boot_log() -> BootLog {
                 let name = if friendly.trim().is_empty() { kind.to_string() } else { friendly };
                 // 以種類＋完整路徑分組（沒有路徑才用名稱），同名但不同的程式不會被合併
                 let key = |s: &SlowItem| if !s.path.is_empty() { s.path.to_lowercase() } else if !s.raw.is_empty() { s.raw.to_lowercase() } else { s.name.to_lowercase() };
-                let me = SlowItem { kind, name, raw, path, count: 1, degr_ms: degr as u64, total_ms: total as u64, max_degr_ms: degr };
+                let when = time_created(x).unwrap_or(0);
+                let me = SlowItem {
+                    kind,
+                    name,
+                    raw,
+                    path,
+                    count: 1,
+                    degr_ms: degr as u64,
+                    total_ms: total as u64,
+                    max_degr_ms: degr,
+                    first: when,
+                    last: when,
+                    startup: Vec::new(),
+                };
                 let k = key(&me);
                 match slow.iter_mut().find(|s| s.kind == kind && key(s) == k) {
                     Some(s) => {
@@ -746,6 +775,10 @@ pub fn boot_log() -> BootLog {
                         s.degr_ms += degr as u64;
                         s.total_ms += total as u64;
                         s.max_degr_ms = s.max_degr_ms.max(degr);
+                        if when != 0 {
+                            s.first = if s.first == 0 { when } else { s.first.min(when) };
+                            s.last = s.last.max(when);
+                        }
                     }
                     None => slow.push(me),
                 }
@@ -771,6 +804,29 @@ pub struct SysCheck {
     pub sys_total: u64,
     /// 系統磁碟沒有回報尋軌延遲（通常是 SSD）；None＝查不到
     pub sys_ssd: Option<bool>,
+    /// 例如「Windows 10 Pro 22H2（組建 19045）」，給「問 AI」的提問用
+    pub os: String,
+}
+
+/// Windows 版本名稱。Windows 11 的 ProductName 仍然寫 Windows 10，要看組建編號。
+fn os_name() -> String {
+    const NT: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let Some(k) = open_key(HKEY_LOCAL_MACHINE, NT, KEY_QUERY_VALUE) else { return "Windows".into() };
+    let s = |n: &str| query(&k, n).filter(|(t, _)| *t == REG_SZ).map(|(_, d)| from_wide_bytes(&d).trim().to_string()).unwrap_or_default();
+    let build: u32 = s("CurrentBuildNumber").parse().unwrap_or(0);
+    let mut product = s("ProductName");
+    if product.is_empty() {
+        product = "Windows".into();
+    }
+    if build >= 22000 {
+        product = product.replacen("Windows 10", "Windows 11", 1);
+    }
+    let ver = s("DisplayVersion");
+    match (ver.is_empty(), build) {
+        (_, 0) => product,
+        (true, b) => format!("{product}（組建 {b}）"),
+        (false, b) => format!("{product} {ver}（組建 {b}）"),
+    }
 }
 
 fn seek_penalty(letter: char) -> Option<bool> {
@@ -829,6 +885,7 @@ pub fn sys_check() -> SysCheck {
         sys_free: info.as_ref().map_or(0, |d| d.free),
         sys_total: info.as_ref().map_or(0, |d| d.total),
         sys_ssd: seek_penalty(letter).map(|p| !p),
+        os: os_name(),
     }
 }
 
@@ -902,25 +959,108 @@ pub fn run(action: Action) -> Option<(String, bool)> {
 
 /// 讀取全部（在背景執行緒呼叫）
 pub fn load() -> BootData {
-    let log = boot_log();
+    let mut log = boot_log();
     let mut items = startup_items();
-    // 開機記錄裡「程式」類的項目，用完整路徑對到開機自動啟動的程式（8.3 短檔名先換成長路徑）
-    if let BootLog::Ok { slow, .. } = &log {
-        for it in &mut items {
-            let Some(exe) = it.exe.as_ref() else { continue };
-            let full = win::final_path(exe).unwrap_or_else(|| exe.clone()).to_string_lossy().to_lowercase();
-            let Some(file) = exe.file_name().map(|f| f.to_string_lossy().to_lowercase()) else { continue };
-            let hit = slow.iter().filter(|s| s.kind == "程式").find(|s| {
-                if s.path.is_empty() { s.raw.to_lowercase() == file } else { s.path.to_lowercase() == full }
-            });
-            if let Some(s) = hit
-                && s.avg_degr() > 0
-            {
-                it.delay_ms = Some(s.avg_degr());
+    // 開機記錄裡「程式」類的項目，用完整路徑對到開機自動啟動的程式（8.3 短檔名先換成長路徑）；
+    // 記錄裡沒有路徑時才比檔名。兩邊都記下對應關係：啟動清單顯示「多花幾秒」，拖慢清單可以直接停用。
+    if let BootLog::Ok { slow, .. } = &mut log {
+        let keys: Vec<Option<(String, String)>> = items
+            .iter()
+            .map(|it| {
+                let exe = it.exe.as_ref()?;
+                let file = exe.file_name()?.to_string_lossy().to_lowercase();
+                let full = win::final_path(exe).unwrap_or_else(|| exe.clone()).to_string_lossy().to_lowercase();
+                Some((full, file))
+            })
+            .collect();
+        for s in slow.iter_mut().filter(|s| s.kind == "程式") {
+            let (path, raw) = (s.path.to_lowercase(), s.raw.to_lowercase());
+            for (i, k) in keys.iter().enumerate() {
+                let Some((full, file)) = k else { continue };
+                if if path.is_empty() { raw == *file } else { path == *full } {
+                    s.startup.push(i);
+                    if s.avg_degr() > 0 {
+                        items[i].delay_ms = Some(items[i].delay_ms.unwrap_or(0).max(s.avg_degr()));
+                    }
+                }
             }
         }
     }
     BootData { log, items, sys: sys_check() }
+}
+
+/// 示範資料（`--demo-boot`，截圖、看版面用）：全部是假的，不讀也不改系統。
+pub fn demo() -> BootData {
+    let now = win::now_filetime();
+    let day = 86_400 * 10_000_000u64;
+    let totals = [92.0, 90.0, 108.0, 99.0, 95.0, 88.0, 104.0, 101.0, 106.0, 106.0, 94.0, 90.0, 100.0, 107.0, 88.5];
+    let boots = totals
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let total = (t * 1000.0) as u32;
+            let main = if i + 1 == totals.len() { 56_600 } else { 24_000 + (i as u32 % 4) * 2_500 };
+            BootRecord { when: now - (200 - i as u64 * 5) * day, total_ms: total, main_ms: main, post_ms: total - main, degraded: i + 1 == totals.len() }
+        })
+        .collect();
+    let item = |display: &str, command: &str, exe: &str, source: Source, missing: bool| StartupItem {
+        name: display.into(),
+        display: display.into(),
+        command: command.into(),
+        exe: Some(PathBuf::from(exe)),
+        missing,
+        source,
+        enabled: true,
+        policy: false,
+        store_key: None,
+        delay_ms: None,
+    };
+    let steam = r"C:\Program Files (x86)\Steam\steam.exe";
+    let mut items = vec![
+        item("Steam", &format!("\"{steam}\" -silent"), steam, Source::UserRun, false),
+        item("OneDrive", r"C:\Users\demo\AppData\Local\Microsoft\OneDrive\OneDrive.exe /background", r"C:\Users\demo\AppData\Local\Microsoft\OneDrive\OneDrive.exe", Source::UserRun, false),
+        item("SecurityHealth", r"%windir%\system32\SecurityHealthSystray.exe", r"C:\Windows\system32\SecurityHealthSystray.exe", Source::MachineRun, false),
+        item("Helper", r"D:\Tools\helper\helper.exe --tray", r"D:\Tools\helper\helper.exe", Source::UserRun, false),
+        item("CMNotify", r"D:\Program Files (x86)\CMoney\CMNotify.exe", r"D:\Program Files (x86)\CMoney\CMNotify.exe", Source::UserRun, true),
+    ];
+    items[0].delay_ms = Some(30_000);
+    let slow_item = |kind: &'static str, name: &str, raw: &str, path: &str, count: u32, avg: u32, startup: Vec<usize>| SlowItem {
+        kind,
+        name: name.into(),
+        raw: raw.into(),
+        path: path.into(),
+        count,
+        degr_ms: avg as u64 * count as u64,
+        total_ms: (avg as u64 + 5_000) * count as u64,
+        max_degr_ms: avg + avg / 3,
+        first: now - 200 * day,
+        last: now - 130 * day,
+        startup,
+    };
+    let mut slow = vec![
+        slow_item("程式", "Windsurf", "Windsurf.exe", r"C:\Users\demo\AppData\Local\Programs\Windsurf\Windsurf.exe", 6, 127_100, vec![]),
+        slow_item("程式", "McAfee Framework Host Service", "mc-fw-host.exe", r"C:\Program Files\McAfee\Framework\mc-fw-host.exe", 4, 36_400, vec![]),
+        slow_item("程式", "McAfee Framework Host Service", "mc-sec-host.exe", r"C:\Program Files\McAfee\Security\mc-sec-host.exe", 5, 27_500, vec![]),
+        slow_item("程式", "VirtualBox Headless Frontend", "VBoxHeadless.exe", r"C:\Program Files\Oracle\VirtualBox\VBoxHeadless.exe", 2, 66_500, vec![]),
+        slow_item("程式", "vmmem", "vmmem", "", 3, 38_700, vec![]),
+        slow_item("程式", "Steam", "steam.exe", steam, 3, 30_000, vec![0]),
+        slow_item("程式", "Codeium", "language_server_windows_x64.exe", r"C:\Users\demo\.codeium\language_server_windows_x64.exe", 4, 29_000, vec![]),
+        slow_item("程式", "crosvm.exe", "crosvm.exe", r"C:\Program Files\Google\Play Games\current\emulator\crosvm.exe", 1, 98_300, vec![]),
+        slow_item("程式", "Windows Services 的主機處理程序", "svchost.exe", r"C:\Windows\System32\svchost.exe", 17, 4_700, vec![]),
+        slow_item("服務", "Demo Sync Service", "demosync.exe", r"C:\Program Files\Demo\demosync.exe", 2, 8_000, vec![]),
+        slow_item("驅動程式", "Realtek PCIe GbE Family Controller", "rt640x64.sys", "", 3, 3_000, vec![]),
+    ];
+    slow.sort_by(|a, b| b.degr_ms.cmp(&a.degr_ms));
+    let sys = SysCheck {
+        fast_startup: Some(true),
+        hibernate: Some(true),
+        sys_drive: "C:".into(),
+        sys_free: 325 << 30,
+        sys_total: 1024 << 30,
+        sys_ssd: Some(true),
+        os: "Windows 10 Pro 22H2（組建 19045）".into(),
+    };
+    BootData { log: BootLog::Ok { boots, slow, note: None }, items, sys }
 }
 
 // ---------------------------------------------------------------------------

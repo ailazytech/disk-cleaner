@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod advice;
 mod anim;
 mod app;
 mod boot;
@@ -407,6 +408,9 @@ fn selftest() -> bool {
     for (name, cond) in boot::selftest() {
         check(name, cond);
     }
+    for (name, cond) in advice::selftest() {
+        check(name, cond);
+    }
 
     // 10. 第二輪審查（Codex gpt-6.1-sol）
     // 10a. 握住的資料夾與它的上層都不能被改名（刪除途中不能被換成 junction）
@@ -632,11 +636,17 @@ fn main() {
             bench_projects(&args[2..]);
             return;
         }
+        // 印出「開機加速」分頁的「複製完整報告問 AI」內容（開機記錄要系統管理員才讀得到）
+        Some("--boot-report") => {
+            println!("{}", advice::full_report(&boot::load()));
+            return;
+        }
         _ => {}
     }
     // --tab dash|clean|analyze：指定開啟的分頁（截圖用）
     let tab = args.iter().position(|a| a == "--tab").and_then(|i| args.get(i + 1)).cloned();
     let demo_clean = args.iter().any(|a| a == "--demo-clean");
+    let demo_boot = args.iter().any(|a| a == "--demo-boot");
     // --analyze <路徑> 或直接給路徑：啟動後馬上分析
     let analyze = match args.get(1).map(|s| s.as_str()) {
         Some("--analyze") => args.get(2).map(std::path::PathBuf::from),
@@ -667,6 +677,11 @@ fn main() {
             if demo_clean {
                 a.tab = app::Tab::Clean;
                 a.start_demo_clean(&cc.egui_ctx);
+            }
+            // --demo-boot：開機加速分頁改用假資料（截圖、看版面用），按鈕都不會改設定
+            if demo_boot {
+                a.tab = app::Tab::Boot;
+                a.boot.demo = true;
             }
             Ok(Box::new(a))
         }));

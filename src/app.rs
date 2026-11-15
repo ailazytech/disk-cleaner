@@ -37,6 +37,12 @@ pub struct BootState {
     pub job: Option<crossbeam_channel::Receiver<(crate::boot::BootData, Option<(String, bool)>)>>,
     /// （訊息, 是不是錯誤）
     pub msg: Option<(String, bool)>,
+    /// 剛按過的「問 AI」按鈕（哪一個, 按下的時間），按鈕上顯示「已複製」一下子
+    pub copied: Option<(String, f64)>,
+    /// 拖慢開機的項目全部列出（預設只列前 15 項）
+    pub show_all_slow: bool,
+    /// 示範模式（--demo-boot）：顯示假資料，所有按鈕都不會改設定
+    pub demo: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +557,13 @@ impl App {
     /// 在背景執行（切換啟動項目、快速啟動會寫登錄或跑 powercfg，不能卡住畫面），完成後重新讀取全部。
     pub fn start_boot_action(&mut self, ctx: &egui::Context, action: crate::boot::Action) {
         if self.boot.job.is_some() {
+            return;
+        }
+        if self.boot.demo {
+            if !matches!(action, crate::boot::Action::Reload) {
+                self.boot.msg = Some(("示範模式不會改任何設定。".into(), false));
+            }
+            self.boot.data = Some(crate::boot::demo());
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);

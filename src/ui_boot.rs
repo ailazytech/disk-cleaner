@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke, vec2};
 
+use crate::advice::{self, Advice, Rec};
 use crate::app::{App, Tab};
 use crate::boot::{self, Action, BootLog, StartupItem};
 use crate::fmt;
@@ -13,6 +14,53 @@ fn secs(ms: u32) -> String {
 
 fn title(ui: &mut egui::Ui, t: &str) {
     ui.label(RichText::new(t).size(17.0).strong());
+}
+
+/// 超過 30 天前的記錄算「偏舊」
+fn stale(when: u64) -> bool {
+    when != 0 && crate::win::now_filetime().saturating_sub(when) > 30 * 86_400 * 10_000_000
+}
+
+/// 建議標籤：開機不啟用／延後啟用／保留；認不得的是「不確定」。滑鼠移上去說明是什麼、怎麼做。
+fn rec_tag(ui: &mut egui::Ui, adv: Option<Advice>) {
+    let (text, c) = match adv.map(|a| a.rec) {
+        Some(Rec::Off) => ("開機不啟用", theme::TAG_ORANGE),
+        Some(Rec::Later) => ("延後啟用", theme::TAG_PERI),
+        Some(Rec::Keep) => ("保留", theme::TAG_GREEN),
+        None => ("不確定", theme::TAG_GRAY),
+    };
+    theme::tag(ui, 74.0, text, c, |ui| match adv {
+        Some(a) => {
+            ui.label(RichText::new(format!("建議：{}", a.rec.label())).strong().color(c.0));
+            ui.label(RichText::new(a.what).color(TEXT).strong());
+            ui.label(a.how);
+            ui.label(RichText::new("這是依名稱和路徑判斷的，拿不準時可以按「問 AI」再確認。").small().color(DIM));
+        }
+        None => {
+            ui.label(RichText::new("不確定").strong().color(c.0));
+            ui.label("這個工具不認得它。按右邊的「問 AI」複製一段提問，貼給 ChatGPT、Claude 或 Gemini，問它是什麼、能不能停用。");
+        }
+    });
+}
+
+const AI_HINT: &str = "複製一段提問到剪貼簿，貼到 ChatGPT、Claude、Gemini 等 AI，就能問它是什麼、要不要停用。路徑裡的使用者資料夾會換成 %USERPROFILE%。";
+
+/// 「問 AI」按鈕；剛複製過的顯示「已複製」
+fn ai_button(ui: &mut egui::Ui, copied: bool) -> bool {
+    let (txt, col) = if copied { ("已複製 ✔", GREEN) } else { ("問 AI", BLUE) };
+    ui.add_sized([66.0, 20.0], egui::Button::new(RichText::new(txt).size(12.0).color(col))).on_hover_text(AI_HINT).clicked()
+}
+
+fn is_copied(app: &App, ui: &egui::Ui, key: &str) -> bool {
+    let now = ui.input(|i| i.time);
+    app.boot.copied.as_ref().is_some_and(|(k, t)| k == key && now - t < 2.0)
+}
+
+fn copy(app: &mut App, ui: &egui::Ui, key: String, text: String) {
+    ui.ctx().copy_text(text);
+    app.boot.copied = Some((key, ui.input(|i| i.time)));
+    // 兩秒後把「已複製」換回來
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(2100));
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -75,6 +123,19 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
                 app.boot.msg = None;
                 app.start_boot_load(ui.ctx());
             }
+            let done = is_copied(app, ui, "all");
+            let r = ui
+                .add_enabled(app.boot.data.is_some(), egui::Button::new(if done { "已複製 ✔" } else { "📋 複製完整報告問 AI" }))
+                .on_hover_text(
+                    "把開機時間、系統設定、開機自動啟動的程式和拖慢開機的項目整理成一段提問，貼給 ChatGPT、Claude 或 Gemini，\
+                     請它排出處理順序。路徑裡的使用者資料夾會換成 %USERPROFILE%。",
+                );
+            if r.clicked()
+                && let Some(d) = &app.boot.data
+            {
+                let text = advice::full_report(d);
+                copy(app, ui, "all".into(), text);
+            }
             if busy {
                 ui.spinner();
                 ui.label(RichText::new("處理中…").small().color(DIM));
@@ -110,6 +171,12 @@ fn boot_time_card(app: &mut App, ui: &mut egui::Ui) {
                         ui.label(RichText::new(format!("上次開機（{}）", fmt::ago(last.when))).color(DIM));
                         if last.degraded {
                             ui.label(RichText::new("Windows 判定比平常慢").small().color(ORANGE));
+                        }
+                        if stale(last.when) {
+                            ui.label(RichText::new("記錄偏舊，可能和現在不同").small().color(ORANGE)).on_hover_text(format!(
+                                "Windows 不是每次開機都會寫這份開機效能記錄。最近一筆是{}，之後的開機都沒有記錄，所以這裡的數字可能和現在的狀況不同。",
+                                fmt::ago(last.when)
+                            ));
                         }
                     });
                 });
@@ -310,6 +377,8 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
     let enabled = gs.iter().filter(|g| any_on(g)).count();
     let total = gs.len();
     let mut action: Option<Action> = None;
+    let mut ask: Option<usize> = None;
+    let copied: Vec<bool> = gs.iter().map(|g| is_copied(app, ui, &format!("s{}", g[0]))).collect();
     theme::glass().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -325,27 +394,30 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         if items.is_empty() {
             ui.label(RichText::new("沒有找到開機自動啟動的程式。").color(DIM));
         }
-        for g in &gs {
+        for (gi, g) in gs.iter().enumerate() {
             let it = &items[g[0]];
             let on_count = g.iter().filter(|&&i| items[i].enabled).count();
             let admin_lock = it.source.needs_admin() && !elevated;
             let locked = admin_lock || it.policy || busy;
             let mut on = on_count > 0;
             let d = delay(g);
+            let mut asked = false;
             let (_, _, clicked) = theme::list_row(
                 ui,
                 26.0,
                 |ui| {
                     theme::right_cell(ui, 150.0, it.source.label(), FontId::proportional(12.0), DIM);
                     if d > 0 {
-                        theme::right_cell(ui, 110.0, &format!("多花 {}", secs(d)), FontId::proportional(12.5), ORANGE)
+                        theme::right_cell(ui, 100.0, &format!("多花 {}", secs(d)), FontId::proportional(12.5), ORANGE)
                             .on_hover_text("開機效能記錄裡，這個程式讓開機比平常多花的平均時間");
                     } else {
-                        theme::right_cell(ui, 110.0, "", FontId::proportional(12.5), DIM);
+                        theme::right_cell(ui, 100.0, "", FontId::proportional(12.5), DIM);
                     }
+                    asked = ai_button(ui, copied[gi]);
                 },
                 |ui| {
                     let r = ui.add_enabled_ui(!locked, |ui| theme::check(ui, &mut on)).inner;
+                    rec_tag(ui, advice::for_startup(it));
                     if admin_lock {
                         ui.label(RichText::new("🔒").small().color(ORANGE)).on_hover_text("這一項套用在所有使用者，要系統管理員權限才能改");
                     } else if it.policy {
@@ -377,6 +449,9 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                 let target = on_count == 0;
                 action = Some(Action::Toggle(g.iter().map(|&i| items[i].clone()).collect(), target));
             }
+            if asked {
+                ask = Some(gi);
+            }
         }
         ui.add_space(6.0);
         ui.label(
@@ -392,17 +467,37 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         app.boot.msg = None;
         app.start_boot_action(ui.ctx(), a);
     }
+    if let Some(gi) = ask
+        && let Some(d) = &app.boot.data
+    {
+        let group: Vec<&StartupItem> = gs[gi].iter().filter_map(|&i| items.get(i)).collect();
+        let text = advice::startup_prompt(&group, &d.sys.os);
+        copy(app, ui, format!("s{}", gs[gi][0]), text);
+    }
 }
 
 // ---------------------------------------------------------------------------
 
 fn slow_card(app: &mut App, ui: &mut egui::Ui) {
+    let elevated = app.elevated;
+    let busy = app.boot.job.is_some();
+    let show_all = app.boot.show_all_slow;
     let Some(data) = &app.boot.data else { return };
+    let n_slow = match &data.log {
+        BootLog::Ok { slow, .. } => slow.len(),
+        _ => 0,
+    };
+    let copied: Vec<bool> = (0..n_slow).map(|i| is_copied(app, ui, &format!("w{i}"))).collect();
+    let mut action: Option<Action> = None;
+    let mut ask: Option<usize> = None;
+    let mut flip_all = false;
     theme::glass().show(ui, |ui| {
         ui.set_width(ui.available_width());
         title(ui, "拖慢開機的項目");
         ui.label(
-            RichText::new("Windows 自己的開機效能記錄：這些程式、驅動、服務或裝置讓開機比平常慢。數字是平均每次多花的時間。").small().color(DIM),
+            RichText::new("Windows 自己的開機效能記錄：這些程式、驅動、服務或裝置讓開機比平常慢，數字是平均每次多花的時間。標籤是建議的處理方式，滑鼠移上去看說明。")
+                .small()
+                .color(DIM),
         );
         ui.add_space(4.0);
         match &data.log {
@@ -413,23 +508,61 @@ fn slow_card(app: &mut App, ui: &mut egui::Ui) {
                 if slow.is_empty() {
                     ui.label(RichText::new("最近的開機記錄裡沒有特別拖慢的項目。").color(DIM));
                 }
-                for s in slow.iter().take(15) {
+                let first = slow.iter().map(|s| s.first).filter(|&t| t != 0).min();
+                let last = slow.iter().map(|s| s.last).max().filter(|&t| t != 0);
+                if let (Some(f), Some(l)) = (first, last) {
+                    let mut t = format!("記錄期間：{} ～ {}", fmt::ago(f), fmt::ago(l));
+                    let col = if stale(l) {
+                        t += "。之後的開機都沒有新記錄，這些可能是比較舊的狀況。";
+                        ORANGE
+                    } else {
+                        DIM
+                    };
+                    ui.label(RichText::new(t).small().color(col));
+                }
+                let shown = if show_all { slow.len() } else { slow.len().min(15) };
+                for (i, s) in slow.iter().enumerate().take(shown) {
+                    let linked: Vec<&StartupItem> = s.startup.iter().filter_map(|&k| data.items.get(k)).collect();
+                    let mut asked = false;
+                    let mut stop = false;
                     theme::list_row(
                         ui,
-                        24.0,
+                        26.0,
                         |ui| {
-                            theme::right_cell(ui, 90.0, &format!("{} 次", s.count), FontId::proportional(12.0), DIM);
+                            theme::right_cell(ui, 56.0, &format!("{} 次", s.count), FontId::proportional(12.0), DIM);
                             let (txt, col) = if s.avg_degr() > 0 {
                                 (format!("多花 {}", secs(s.avg_degr())), ORANGE)
                             } else {
                                 (format!("啟動 {}", secs(s.avg_total())), DIM)
                             };
-                            theme::right_cell(ui, 110.0, &txt, FontId::proportional(13.0), col).on_hover_text(format!(
+                            let mut hover = format!(
                                 "啟動平均花 {}，比平常多 {}；最多一次多花 {}",
                                 secs(s.avg_total()),
                                 secs(s.avg_degr()),
                                 secs(s.max_degr_ms)
-                            ));
+                            );
+                            if s.last != 0 {
+                                hover += &format!("\n最近一次記錄：{}", fmt::ago(s.last));
+                            }
+                            theme::right_cell(ui, 100.0, &txt, FontId::proportional(13.0), col).on_hover_text(hover);
+                            asked = ai_button(ui, copied[i]);
+                            // 有登記成開機自動啟動的，直接在這裡停用（和上面清單取消勾選相同）
+                            let on: Vec<&&StartupItem> = linked.iter().filter(|it| it.enabled).collect();
+                            if linked.is_empty() {
+                                ui.allocate_exact_size(vec2(104.0, 20.0), Sense::hover());
+                            } else if on.is_empty() {
+                                theme::right_cell(ui, 104.0, "已停用自動啟動", FontId::proportional(12.0), GREEN);
+                            } else {
+                                let lock = busy || on.iter().any(|it| it.policy || (it.source.needs_admin() && !elevated));
+                                let r = ui.add_enabled(!lock, egui::Button::new(RichText::new("停用自動啟動").size(12.0)).min_size(vec2(104.0, 20.0)));
+                                let r = r.on_hover_text(format!(
+                                    "它是開機自動啟動的「{}」。停用後開機時不會自動執行（和上面清單取消勾選相同），程式本身不會被移除，隨時可以再打開。",
+                                    on[0].display
+                                ));
+                                if r.clicked() {
+                                    stop = true;
+                                }
+                            }
                         },
                         |ui| {
                             let col = match s.kind {
@@ -438,19 +571,43 @@ fn slow_card(app: &mut App, ui: &mut egui::Ui) {
                                 "服務" => PERI,
                                 _ => DIM,
                             };
-                            ui.add_sized([72.0, 18.0], egui::Label::new(RichText::new(s.kind).small().color(col)));
+                            ui.add_sized([60.0, 18.0], egui::Label::new(RichText::new(s.kind).small().color(col)));
+                            rec_tag(ui, advice::for_slow(s));
                             let detail = if s.path.is_empty() { s.raw.clone() } else { s.path.clone() };
                             ui.add(egui::Label::new(RichText::new(&s.name).color(TEXT)).truncate())
-                                .on_hover_text(if detail.is_empty() { s.name.clone() } else { detail });
+                                .on_hover_text(if detail.is_empty() { s.name.clone() } else { detail.clone() });
+                            // 同名的不同程式（例如防毒的好幾個元件）靠檔名分辨
+                            let file = if !s.raw.is_empty() {
+                                s.raw.clone()
+                            } else {
+                                std::path::Path::new(&s.path).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+                            };
+                            if !file.is_empty() && !file.eq_ignore_ascii_case(&s.name) {
+                                ui.add(egui::Label::new(RichText::new(file).small().color(DIM)).truncate()).on_hover_text(detail);
+                            }
                         },
                     );
+                    if stop {
+                        let on: Vec<StartupItem> = linked.iter().filter(|it| it.enabled).map(|it| (*it).clone()).collect();
+                        action = Some(Action::Toggle(on, false));
+                    }
+                    if asked {
+                        ask = Some(i);
+                    }
+                }
+                if slow.len() > 15 {
+                    let t = if show_all { "只顯示前 15 項".to_string() } else { format!("顯示全部 {} 項", slow.len()) };
+                    if ui.small_button(t).clicked() {
+                        flip_all = true;
+                    }
                 }
                 if !slow.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
-                            "怎麼處理：「程式」可以在上面停用它的開機自動啟動；「服務」可以在「服務」（services.msc）把用不到的改成「自動（延遲開始）」或「手動」；\
-                             「驅動程式」和「裝置」通常要更新驅動，或在裝置管理員停用用不到的裝置；「群組原則」是公司網域的登入設定，要找 IT 處理。",
+                            "怎麼處理：有登記成開機自動啟動的程式，可以直接按「停用自動啟動」。沒有登記的，通常是你開機後自己打開的、登入時被自動重新打開的，\
+                             或由服務、工作排程器帶起來的，滑鼠移到標籤上看做法。「服務」可以在「服務」（services.msc）把用不到的改成「自動（延遲開始）」或「手動」；\
+                             「驅動程式」和「裝置」通常要更新驅動；「群組原則」是公司網域的登入設定，要找 IT 處理。",
                         )
                         .small()
                         .color(DIM),
@@ -465,4 +622,19 @@ fn slow_card(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+    if flip_all {
+        app.boot.show_all_slow = !show_all;
+    }
+    if let Some(a) = action {
+        app.boot.msg = None;
+        app.start_boot_action(ui.ctx(), a);
+    }
+    if let Some(i) = ask
+        && let Some(d) = &app.boot.data
+        && let BootLog::Ok { slow, .. } = &d.log
+        && let Some(s) = slow.get(i)
+    {
+        let text = advice::slow_prompt(s, &d.items, &d.sys.os);
+        copy(app, ui, format!("w{i}"), text);
+    }
 }

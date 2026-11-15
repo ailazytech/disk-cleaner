@@ -282,20 +282,35 @@ pub fn suggest_slot(ui: &mut egui::Ui, show: bool, why: &str) {
     });
 }
 
-/// 「安全／注意」小標籤。滑鼠移上去說明為什麼安全、或要注意什麼。
-pub fn risk_tag(ui: &mut egui::Ui, caution: bool, why: &str) {
-    let (txt, fg, bg, bg_hot, line) = if caution {
-        ("注意", Color32::from_rgb(214, 128, 52), Color32::from_rgb(255, 243, 230), Color32::from_rgb(255, 232, 208), Color32::from_rgb(246, 210, 172))
-    } else {
-        ("安全", Color32::from_rgb(64, 160, 110), Color32::from_rgb(232, 247, 238), Color32::from_rgb(214, 241, 225), Color32::from_rgb(190, 228, 206))
-    };
-    let (r, resp) = ui.allocate_exact_size(Vec2::new(36.0, 19.0), Sense::hover());
+/// 標籤的配色：（文字, 底色, 滑鼠移上去的底色, 外框）
+pub type TagColors = (Color32, Color32, Color32, Color32);
+pub const TAG_ORANGE: TagColors =
+    (Color32::from_rgb(214, 128, 52), Color32::from_rgb(255, 243, 230), Color32::from_rgb(255, 232, 208), Color32::from_rgb(246, 210, 172));
+pub const TAG_GREEN: TagColors =
+    (Color32::from_rgb(64, 160, 110), Color32::from_rgb(232, 247, 238), Color32::from_rgb(214, 241, 225), Color32::from_rgb(190, 228, 206));
+pub const TAG_PERI: TagColors =
+    (Color32::from_rgb(96, 98, 210), Color32::from_rgb(240, 240, 255), Color32::from_rgb(228, 228, 255), Color32::from_rgb(208, 208, 246));
+pub const TAG_GRAY: TagColors =
+    (Color32::from_rgb(124, 132, 158), Color32::from_rgb(243, 245, 250), Color32::from_rgb(232, 235, 244), Color32::from_rgb(218, 222, 234));
+
+/// 固定寬度的圓角小標籤（同一欄才會對齊）；滑鼠移上去顯示 hover 的內容。
+pub fn tag(ui: &mut egui::Ui, width: f32, text: &str, c: TagColors, hover: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let (fg, bg, bg_hot, line) = c;
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(width, 19.0), Sense::hover());
     let hot = resp.hovered();
     ui.painter().rect(r, 10, if hot { bg_hot } else { bg }, Stroke::new(1.0, if hot { with_alpha(fg, 160) } else { line }), egui::StrokeKind::Inside);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, txt, FontId::proportional(11.5), fg);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.5), fg);
     resp.on_hover_ui(|ui| {
-        ui.set_max_width(360.0);
-        ui.label(egui::RichText::new(if caution { "要注意的地方" } else { "為什麼安全" }).strong().color(fg));
+        ui.set_max_width(380.0);
+        hover(ui);
+    })
+}
+
+/// 「安全／注意」小標籤。滑鼠移上去說明為什麼安全、或要注意什麼。
+pub fn risk_tag(ui: &mut egui::Ui, caution: bool, why: &str) {
+    let (txt, title, c) = if caution { ("注意", "要注意的地方", TAG_ORANGE) } else { ("安全", "為什麼安全", TAG_GREEN) };
+    tag(ui, 36.0, txt, c, |ui| {
+        ui.label(egui::RichText::new(title).strong().color(c.0));
         ui.label(why);
     });
 }
