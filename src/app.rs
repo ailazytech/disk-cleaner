@@ -33,7 +33,8 @@ pub enum Tab {
 #[derive(Default)]
 pub struct BootState {
     pub data: Option<crate::boot::BootData>,
-    pub job: Option<crossbeam_channel::Receiver<crate::boot::BootData>>,
+    /// 背景工作（讀取，或切換後重新讀取）：回傳新資料與要顯示的訊息。進行中時所有開關都鎖住
+    pub job: Option<crossbeam_channel::Receiver<(crate::boot::BootData, Option<(String, bool)>)>>,
     /// （訊息, 是不是錯誤）
     pub msg: Option<(String, bool)>,
 }
@@ -145,6 +146,8 @@ pub struct CleanJob {
     pub finished: Option<f32>,
     /// 進度視窗的垃圾桶動畫
     pub anim: crate::anim::TrashAnim,
+    /// 只是示範（--demo-clean）：完成後不做任何清理收尾，也不寫快取
+    pub demo: bool,
 }
 
 pub struct CleanState {
@@ -542,11 +545,20 @@ impl App {
 
     /// 開機加速分頁：在背景讀開機記錄、啟動項目與系統設定
     pub fn start_boot_load(&mut self, ctx: &egui::Context) {
+        self.start_boot_action(ctx, crate::boot::Action::Reload);
+    }
+
+    /// 在背景執行（切換啟動項目、快速啟動會寫登錄或跑 powercfg，不能卡住畫面），完成後重新讀取全部。
+    pub fn start_boot_action(&mut self, ctx: &egui::Context, action: crate::boot::Action) {
+        if self.boot.job.is_some() {
+            return;
+        }
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.boot.job = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::boot::load());
+            let msg = crate::boot::run(action);
+            let _ = tx.send((crate::boot::load(), msg));
             ctx.request_repaint();
         });
     }
@@ -564,6 +576,7 @@ impl App {
             rule_idx: Vec::new(),
             finished: None,
             anim: Default::default(),
+            demo: true,
         });
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -637,6 +650,7 @@ impl App {
             rule_idx,
             finished: None,
             anim: Default::default(),
+            demo: false,
         });
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -759,6 +773,9 @@ impl App {
         let Some(job) = &mut self.clean.job else { return };
         if job.finished.is_none() && job.done.load(Relaxed) {
             job.finished = Some(job.started.elapsed().as_secs_f32());
+            if job.demo {
+                return; // 示範模式：不動清單、不寫快取、不重算
+            }
             let idx = job.rule_idx.clone();
             // 移除已刪掉的專案產物
             self.clean.proj.items.retain(|a| !(a.checked && !a.art.path.exists()));

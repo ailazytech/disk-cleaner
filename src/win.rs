@@ -870,33 +870,32 @@ pub fn volume_name(root: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
+/// 一個 Known Folder 的實際位置（不會建立資料夾）。
+pub fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    use windows_sys::Win32::UI::Shell as sh;
+    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let hr = unsafe { sh::SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) };
+    let mut out = None;
+    if hr >= 0 && !p.is_null() {
+        let mut n = 0;
+        unsafe {
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            out = Some(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(p, n))));
+        }
+    }
+    if !p.is_null() {
+        unsafe { windows_sys::Win32::System::Com::CoTaskMemFree(p as *const _) };
+    }
+    out
+}
+
 /// Known Folder 的實際位置（文件、桌面…被搬到別的磁碟也找得到）。
 pub fn known_folders() -> Vec<PathBuf> {
     use windows_sys::Win32::UI::Shell as sh;
-    let ids = [
-        sh::FOLDERID_Documents,
-        sh::FOLDERID_Desktop,
-        sh::FOLDERID_Downloads,
-        sh::FOLDERID_Pictures,
-        sh::FOLDERID_Music,
-        sh::FOLDERID_Videos,
-    ];
-    let mut out = Vec::new();
-    for id in ids {
-        let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
-        let hr = unsafe { sh::SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut p) };
-        if hr >= 0 && !p.is_null() {
-            let mut n = 0;
-            unsafe {
-                while *p.add(n) != 0 {
-                    n += 1;
-                }
-                out.push(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(p, n))));
-            }
-        }
-        if !p.is_null() {
-            unsafe { windows_sys::Win32::System::Com::CoTaskMemFree(p as *const _) };
-        }
-    }
-    out
+    [sh::FOLDERID_Documents, sh::FOLDERID_Desktop, sh::FOLDERID_Downloads, sh::FOLDERID_Pictures, sh::FOLDERID_Music, sh::FOLDERID_Videos]
+        .iter()
+        .filter_map(known_folder)
+        .collect()
 }

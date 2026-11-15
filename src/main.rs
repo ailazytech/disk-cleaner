@@ -61,34 +61,54 @@ fn bench(path: &str, prefer_cache: bool) {
     println!("總耗時 {:.2}s；管理員={}", t.elapsed().as_secs_f32(), win::is_elevated());
 }
 
-/// --rules：列出每條清理規則可釋放的大小（不刪除）
 /// 刪除速度測試：在暫存資料夾造一棵像 node_modules 的樹，用不同執行緒數刪掉它。
-/// 只會建立、刪除 %TEMP%\dc_bench_delete 底下自己造出來的檔案。
+/// 每次執行都用 create_dir 獨占建立一個新的專屬資料夾（已經存在就中止），只刪這個資料夾裡自己造出來的東西。
 fn bench_delete(args: &[String]) {
     use rayon::prelude::*;
     let total: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(20_000);
     let flat = args.iter().any(|a| a == "flat");
-    let base = std::env::temp_dir().join("dc_bench_delete");
-    let make = || -> std::path::PathBuf {
-        let root = base.join("tree");
-        let _ = std::fs::remove_dir_all(&base);
+    let quick = args.iter().any(|a| a == "quick");
+    let temp = std::env::temp_dir();
+    if !temp.is_absolute() || win::has_reparse_on_path(&temp) {
+        eprintln!("暫存資料夾 {} 不是一般的本機資料夾（或經過連結），不做測試", temp.display());
+        return;
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let base = temp.join(format!("dc_bench_delete_{}_{nanos}", std::process::id()));
+    if let Err(e) = std::fs::create_dir(&base) {
+        eprintln!("無法建立專屬測試資料夾 {}：{e}（已經存在的資料夾一律不用）", base.display());
+        return;
+    }
+    let mut round = 0;
+    // 每一輪在 base 底下獨占建立 roundN，失敗就回傳 None（中止，不覆寫任何東西）
+    let mut make = || -> Option<std::path::PathBuf> {
+        round += 1;
+        let root = base.join(format!("round{round}"));
+        std::fs::create_dir(&root).ok()?;
         // 樹狀：20 個套件 × 10 個子資料夾 × N 個檔案；flat：全部放在同一個資料夾（像 Temp）。大小 0.5～4 KB
         let dirs = if flat { 1 } else { 200 };
         let per = (total / dirs).max(1);
-        (0..dirs).into_par_iter().for_each(|d| {
+        let ok = (0..dirs).into_par_iter().all(|d| {
             let dir = if flat { root.clone() } else { root.join(format!("pkg{:02}", d / 10)).join(format!("lib{}", d % 10)) };
-            std::fs::create_dir_all(&dir).unwrap();
-            for f in 0..per {
-                let n = 512 + (d * 131 + f * 977) % 3584;
-                std::fs::write(dir.join(format!("m{f:04}.js")), vec![b'x'; n]).unwrap();
+            if std::fs::create_dir_all(&dir).is_err() {
+                return false;
             }
+            (0..per).all(|f| {
+                let n = 512 + (d * 131 + f * 977) % 3584;
+                // create_new：同名檔案已存在就失敗，不覆寫
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dir.join(format!("m{f:04}.js")))
+                    .and_then(|mut fh| std::io::Write::write_all(&mut fh, &vec![b'x'; n]))
+                    .is_ok()
+            })
         });
-        root
+        ok.then_some(root)
     };
     let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    println!("每輪 {total} 個檔案（{}）；CPU 邏輯核心 {logical}", if flat { "全在同一個資料夾" } else { "樹狀" });
+    println!("每輪 {total} 個檔案（{}）；CPU 邏輯核心 {logical}；測試資料夾 {}", if flat { "全在同一個資料夾" } else { "樹狀" }, base.display());
     let mut runs: Vec<(String, usize)> = vec![("預設（rayon 全域）".into(), 0)];
-    let quick = args.iter().any(|a| a == "quick");
     for t in [logical / 2, logical, logical * 2, logical * 4] {
         if t >= 1 && !quick {
             runs.push((format!("{t} 執行緒"), t));
@@ -96,7 +116,10 @@ fn bench_delete(args: &[String]) {
     }
     for (label, threads) in runs {
         let t0 = std::time::Instant::now();
-        let root = make();
+        let Some(root) = make() else {
+            eprintln!("建立測試檔案失敗，中止");
+            break;
+        };
         let made = t0.elapsed().as_secs_f64();
         let p = cleaner::DelProgress::default();
         let t1 = std::time::Instant::now();
@@ -113,18 +136,21 @@ fn bench_delete(args: &[String]) {
             if ok { "" } else { " ⚠ 沒刪乾淨" }
         );
     }
-    if quick {
-        let _ = std::fs::remove_dir_all(&base);
-        return;
+    if !quick {
+        // 參考：Rust 標準函式庫的 remove_dir_all（單執行緒），只用在這次自己建立的 roundN
+        if let Some(root) = make() {
+            let t1 = std::time::Instant::now();
+            let _ = std::fs::remove_dir_all(&root);
+            println!("{:<14} {:6.2}s", "std remove_dir_all", t1.elapsed().as_secs_f64());
+        }
     }
-    // 參考：Rust 標準函式庫的 remove_dir_all（單執行緒）
-    let root = make();
-    let t1 = std::time::Instant::now();
-    let _ = std::fs::remove_dir_all(&root);
-    println!("{:<14} {:6.2}s", "std remove_dir_all", t1.elapsed().as_secs_f64());
-    let _ = std::fs::remove_dir_all(&base);
+    // 最後只移除空的專屬資料夾；裡面還有東西（某一輪沒刪乾淨）就留著並告知
+    if std::fs::remove_dir(&base).is_err() {
+        eprintln!("測試資料夾沒有清空，留在 {}", base.display());
+    }
 }
 
+/// --rules：列出每條清理規則可釋放的大小（不刪除）
 fn bench_rules() {
     let t = std::time::Instant::now();
     let rules = rules::catalog();

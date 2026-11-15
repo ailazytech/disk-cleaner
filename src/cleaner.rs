@@ -658,7 +658,7 @@ fn protected_subtree(dir: &Path) -> bool {
 }
 
 /// 把指令輸出（OEM 字碼頁，例如 cp950）轉成字串。
-fn decode_oem(b: &[u8]) -> String {
+pub fn decode_oem(b: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(b) {
         return s.to_string();
     }
