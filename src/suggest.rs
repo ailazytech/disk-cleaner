@@ -140,6 +140,9 @@ pub fn set_checked(app: &mut App, r: &Ref, v: bool) {
     match *r {
         Ref::Rule(i) => app.clean.rows[i].checked = v,
         Ref::Art(i) => app.clean.proj.items[i].checked = v,
-        Ref::Model(i) => app.clean.proj.models[i].checked = v,
+        Ref::Model(i) => {
+            app.clean.proj.models[i].checked = v;
+            app.clean.proj.models[i].via_dup = v;
+        }
     }
 }

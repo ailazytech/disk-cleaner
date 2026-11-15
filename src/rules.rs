@@ -371,18 +371,21 @@ pub fn catalog() -> Vec<Rule> {
 
     // ---------------- 應用程式 ----------------
     let mut b = rule("electron", Apps, "Electron 應用程式快取", "Discord、VS Code、Slack、Teams、Notion、Obsidian 等以 Electron／WebView 製作的應用快取。建議先關閉這些程式。");
-    // 只用 Chromium／Electron 特有的資料夾結構，避免誤中其他軟體自己叫 Cache 的資料夾
-    for sub in [
-        "Cache\\Cache_Data",
-        "Code Cache\\js",
-        "Code Cache\\wasm",
-        "GPUCache",
-        "DawnCache",
-        "DawnGraphiteCache",
-        "DawnWebGPUCache",
-        "Service Worker\\CacheStorage",
-    ] {
-        b = b.contents(&format!("{{APPDATA}}\\*\\{sub}"));
+    // 只用 Chromium／Electron 特有的資料夾結構，而且應用程式資料夾裡要有 Chromium 建立的 Preferences 檔，
+    // 避免誤中其他軟體剛好叫 GPUCache 之類的資料夾
+    for app in chromium_apps() {
+        for sub in [
+            "Cache\\Cache_Data",
+            "Code Cache\\js",
+            "Code Cache\\wasm",
+            "GPUCache",
+            "DawnCache",
+            "DawnGraphiteCache",
+            "DawnWebGPUCache",
+            "Service Worker\\CacheStorage",
+        ] {
+            b = b.contents(&format!("{{APPDATA}}\\{app}\\{sub}"));
+        }
     }
     v.push(b.done());
     let mut b = rule("vscode", Apps, "VS Code 系列快取與記錄", "VS Code、Cursor、Windsurf 的 CachedData、擴充套件安裝暫存與記錄檔。");
@@ -413,6 +416,24 @@ pub fn catalog() -> Vec<Rule> {
 // 路徑展開
 
 /// 讀環境變數：空字串、相對路徑、網路路徑一律不用；`/` 換成 ``。
+/// %APPDATA% 底下看得出是 Chromium／Electron 應用程式的資料夾（裡面有 Chromium 的 Preferences 檔）。
+fn chromium_apps() -> Vec<String> {
+    let Some(base) = env("APPDATA") else { return Vec::new() };
+    let base = PathBuf::from(base);
+    let mut out = Vec::new();
+    let _ = win::list_dir(&base, |e| {
+        if e.is_dir() && !e.is_reparse() {
+            let name = e.name_os().to_string_lossy().into_owned();
+            // 名稱裡有樣板用的符號就跳過（不能被當成 token 或萬用字元）
+            if !name.contains(['{', '}', '*', '?']) && base.join(&name).join("Preferences").is_file() {
+                out.push(name);
+            }
+        }
+    });
+    out.sort();
+    out
+}
+
 fn env(name: &str) -> Option<String> {
     let v = std::env::var(name).ok()?.trim().replace('/', "\\");
     let b = v.as_bytes();

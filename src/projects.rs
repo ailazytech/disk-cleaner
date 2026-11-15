@@ -108,6 +108,14 @@ fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
     if d.child_has_any(name, &[".git", ".hg", ".svn"]) {
         return None;
     }
+    // 任何名稱的虛擬環境都先判斷（uv 建的 venv 有 CACHEDIR.TAG；就算叫 target 也不能當成 Rust 產物）
+    if d.child_has(name, "pyvenv.cfg") {
+        return Some(&VENV);
+    }
+    // 裡面直接有專案定義檔 → 是原始碼專案，不是建置產物（例如在專案根目錄直接跑過 cmake、
+    // 或 target 資料夾其實是另一個專案）。.next、dist 之類的前端輸出本來就會有 package.json，所以另外處理。
+    let src_marker = d.child_has_any(name, &["CMakeLists.txt", "Cargo.toml", "pyproject.toml", "setup.py", "go.mod", "pom.xml"]);
+    let pkg_inside = d.child_has(name, "package.json");
     let n = name.to_lowercase();
     let pkg = d.has("package.json");
     let k: Option<&'static ArtKind> = match n.as_str() {
@@ -118,7 +126,6 @@ fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
             Some(if lock { &NODE } else { &NODE_NOLOCK })
         }
         "target" if d.has("cargo.toml") || valid_cachedir_tag(&d.path.join(name).join("CACHEDIR.TAG")) => Some(&RUST),
-        ".venv" | "venv" | "env" | ".env" if d.child_has(name, "pyvenv.cfg") => Some(&VENV),
         "__pycache__" if only_pyc(&d.path.join(name)) => Some(&PYCACHE),
         ".pytest_cache" | ".mypy_cache" | ".ruff_cache" | ".hypothesis" | ".tox" | ".nox" => Some(&PYTOOLS),
         ".next" | ".nuxt" | ".svelte-kit" | ".turbo" | ".parcel-cache" | ".angular" | ".docusaurus" | ".expo"
@@ -144,15 +151,14 @@ fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
         "dist" | "build" | "out" if pkg => Some(&WEB_BUILD),
         _ => None,
     };
-    if k.is_some() {
-        return k;
+    if let Some(k) = k {
+        if src_marker || (pkg_inside && k.id != "web" && k.id != "web_build") {
+            return None;
+        }
+        return Some(k);
     }
-    // 任何名稱的虛擬環境（uv 建的 venv 也會有 CACHEDIR.TAG，不能當成一般快取）
-    if d.child_has(name, "pyvenv.cfg") {
-        return Some(&VENV);
-    }
-    // 以下是只靠「內容特徵」的判斷：裡面有專案定義檔就是原始碼專案（例如在專案根目錄直接跑過 cmake）
-    if d.child_has_any(name, &["CMakeLists.txt", "Cargo.toml", "package.json", "pyproject.toml", "setup.py", "go.mod", "pom.xml"]) {
+    // 以下是只靠「內容特徵」的判斷：裡面有專案定義檔就一定是原始碼專案
+    if src_marker || pkg_inside {
         return None;
     }
     // CMake 建置目錄：有 CMakeCache.txt、而且沒有 CMakeLists.txt（上面已排除）。

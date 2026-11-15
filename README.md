@@ -52,7 +52,7 @@ A folder is listed only when the matching project marker is there (`package.json
 - Ollama — reads the manifests (honors `OLLAMA_MODELS`); deleting a model removes only the blobs no other model uses
 - LM Studio, ComfyUI, PyTorch hub, Whisper, Jan, GPT4All, InsightFace, ModelScope…
 - Any `.safetensors` / `.gguf` / `.ckpt` / `.pt` / `.pth` / `.onnx` file of 50 MB or more in your search folders
-- Duplicates (same name and size) are flagged; **select duplicates** keeps the newest copy of each
+- Duplicates (same name and size) are flagged; **select duplicates** keeps the newest copy of each, and each one is compared byte for byte with the kept copy before it is deleted
 
 Models are never pre-selected.
 
@@ -81,16 +81,18 @@ On the author's machine a full walk without administrator rights runs at about 1
 Wrongly deleting your data is the worst thing a cleaner can do, so the deletion code is written to fail closed:
 
 - Never follows junctions or symlinks: if a target — or any folder on its path — is a link, it is skipped; links found inside are removed as links only
-- Protected paths are checked after normalizing the path (`/`, `..`, trailing separators, drive-relative paths) **and** after resolving links and 8.3 short names: drive roots, every user profile under `Users`, Documents / Desktop / Downloads, Windows and its system folders (System32, WinSxS…), Program Files, ProgramData, the AppData roots, `$Recycle.Bin`, `System Volume Information`
-- Results shown from the cache are never used to delete: each rule is measured again right before cleaning, and each build artifact is re-detected
-- A folder that contains `.git` / `.hg` / `.svn` is never treated as a build artifact; `CACHEDIR.TAG` must carry the real signature; an in-source CMake build is not mistaken for a build folder
-- Ollama: manifest digests must look like `sha256:<hex>`, blobs are only removed from the `blobs` folder, and nothing is removed if any other manifest can't be read
-- Files in use are skipped; cloud placeholders (OneDrive) are never deleted
-- **Move to Recycle Bin** asks before permanently deleting something that can't be recycled; the analyzer refuses to delete from stale cached data until you rescan
+- Deletion works through handles, not paths: every folder from the drive root down to the item is opened without following links and held open (so nothing can rename it or swap it for a junction mid-delete), and each item is checked and deleted through that same handle
+- Protected paths are checked after normalizing the path (`/`, `..`, trailing separators, drive-relative paths) **and** after resolving links and 8.3 short names: drive roots, every user profile under `Users`, Documents / Desktop / Downloads (even if moved to another drive), Windows and its system folders (System32, WinSxS…), Program Files, ProgramData, the AppData roots, `$Recycle.Bin`, `System Volume Information`
+- Results shown from the cache are never used to delete: each rule is measured again right before cleaning, and each build artifact is re-detected and skipped if anything in it changed since the scan
+- A folder that contains `.git` / `.hg` / `.svn`, or a project file such as `Cargo.toml` / `CMakeLists.txt`, is never treated as a build artifact; `CACHEDIR.TAG` must carry the real signature; a venv is recognised as a venv whatever it is called
+- Duplicate models are compared byte for byte against the copy being kept (and must be two different files) before one is deleted
+- Ollama: manifest digests must look like `sha256:<hex>`, blobs are only removed from the `blobs` folder, and nothing is removed unless every other manifest can be listed, read and parsed completely
+- Files in use are skipped; cloud placeholders (OneDrive) are never deleted; with an age limit, recently created folders are kept; files with other hard links don't count as freed space
+- **Move to Recycle Bin** goes through the same checks as permanent delete and asks before permanently deleting something that can't be recycled; the analyzer refuses to delete from stale cached data until you rescan
 - Clean rules delete permanently (that is how space gets freed)
-- `disk-cleaner.exe --selftest` runs 47 checks in a scratch folder (junctions, read-only files, protected-path aliases, fake projects, a fake Ollama store with a malicious manifest, synthetic MFT records…); CI runs it on every push
+- `disk-cleaner.exe --selftest` runs 63 checks in a scratch folder (junctions, folders held open against renaming, hard links, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
 
-The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release; the issues they found are fixed and covered by the self-test.
+The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes were reviewed again in a second round; the issues found are fixed and covered by the self-test.
 
 ## Build
 

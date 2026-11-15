@@ -95,9 +95,18 @@ pub struct ArtRow {
     pub checked: bool,
 }
 
+/// 刪除「重複的模型」前要做的確認
+enum DupCheck {
+    None,
+    Keep(PathBuf),
+    Stale,
+}
+
 pub struct ModelRow {
     pub m: Model,
     pub checked: bool,
+    /// 是「勾選重複的」或儀表板建議勾的：刪除前要確認保留的那份內容完全相同
+    pub via_dup: bool,
 }
 
 pub struct ProjState {
@@ -376,7 +385,7 @@ impl App {
             let elevated = self.elevated;
             let row = &mut self.clean.rows[i];
             let first = row.measured.is_none();
-            let has = m.bytes > 0;
+            let has = m.bytes > 0 || (matches!(row.rule.action, rules::Action::RecycleBin) && m.files > 0);
             row.measured = Some(m);
             if first {
                 row.checked = default_checked(row, elevated);
@@ -407,7 +416,7 @@ impl App {
             self.clean.cached_age = Some(age);
         }
         if let Some((arts, models, age)) = crate::results_cache::load_projects() {
-            self.clean.proj.models = models.into_iter().map(|m| ModelRow { m, checked: false }).collect();
+            self.clean.proj.models = models.into_iter().map(|m| ModelRow { m, checked: false, via_dup: false }).collect();
             let week_ago = win::now_filetime().saturating_sub(7 * win::FILETIME_DAY);
             self.clean.proj.items = arts
                 .into_iter()
@@ -464,12 +473,14 @@ impl App {
         if !new_models.is_empty() {
             let checked: std::collections::HashSet<PathBuf> =
                 self.clean.proj.models.iter().filter(|r| r.checked).map(|r| r.m.path.clone()).collect();
+            let via_dup: std::collections::HashSet<PathBuf> =
+                self.clean.proj.models.iter().filter(|r| r.via_dup).map(|r| r.m.path.clone()).collect();
             let mut all: Vec<Model> = self.clean.proj.models.drain(..).map(|r| r.m).collect();
             all.extend(new_models);
             crate::models::dedup(&mut all);
             all.sort_by(|a, b| b.bytes.cmp(&a.bytes));
             self.clean.proj.models =
-                all.into_iter().map(|m| ModelRow { checked: checked.contains(&m.path), m }).collect();
+                all.into_iter().map(|m| ModelRow { checked: checked.contains(&m.path), via_dup: via_dup.contains(&m.path), m }).collect();
         }
         if finished {
             self.clean.proj.secs = Some(self.clean.proj.started.elapsed().as_secs_f32());
@@ -520,15 +531,34 @@ impl App {
                 rule_idx.push(i);
             }
         }
-        let arts: Vec<(PathBuf, &'static str)> = self
+        let arts: Vec<(PathBuf, &'static str, u64)> = self
             .clean
             .proj
             .items
             .iter()
             .filter(|a| a.checked)
-            .map(|a| (a.art.path.clone(), a.art.kind.id))
+            .map(|a| (a.art.path.clone(), a.art.kind.id, a.art.newest))
             .collect();
-        let models: Vec<Model> = self.clean.proj.models.iter().filter(|m| m.checked).map(|m| m.m.clone()).collect();
+        // 因為「重複」才勾的模型：刪除前要和保留的那份比對內容
+        let rows = &self.clean.proj.models;
+        let dups = crate::suggest::model_dups(rows);
+        let models: Vec<(Model, DupCheck)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.checked)
+            .map(|(i, r)| {
+                let check = if !r.via_dup || r.m.del != crate::models::ModelDel::File {
+                    DupCheck::None
+                } else {
+                    match dups[i] {
+                        Some(k) if !rows[k].checked => DupCheck::Keep(rows[k].m.path.clone()),
+                        Some(_) => DupCheck::None, // 保留的那份也被手動勾了：照使用者的選擇
+                        None => DupCheck::Stale,
+                    }
+                };
+                (r.m.clone(), check)
+            })
+            .collect();
         let (planned, _) = self.selected_bytes();
         prog.steps.store((plan.len() + arts.len() + models.len()) as u64, Relaxed);
         self.clean.job = Some(CleanJob {
@@ -566,6 +596,16 @@ impl App {
                 // 刪除前重新確認它現在還是同一種建置產物（快取可能是舊的）
                 if crate::projects::revalidate(&a.0).is_none_or(|k| k.id != a.1) {
                     prog.log(format!("⚠ {}：已經不是建置產物（或專案標記不見了），已略過", a.0.display()));
+                    prog.failed.fetch_add(1, Relaxed);
+                    prog.step.fetch_add(1, Relaxed);
+                    continue;
+                }
+                // 掃描之後又有新的檔案（例如剛重新 build 過）：勾選時看到的「多久沒動」已經不對了
+                *prog.current.lock() = format!("確認 {} 沒有變動…", a.0.display());
+                let now = crate::scan::dir_size(&a.0, u64::MAX, &prog.cancel);
+                if now.newest > a.2 {
+                    prog.log(format!("⚠ {}：掃描之後有新的變動（{}），已略過；請重新搜尋再決定", a.0.display(), fmt::ago(now.newest)));
+                    prog.failed.fetch_add(1, Relaxed);
                     prog.step.fetch_add(1, Relaxed);
                     continue;
                 }
@@ -581,11 +621,26 @@ impl App {
                 prog.step.fetch_add(1, Relaxed);
                 ctx.request_repaint();
             }
-            for m in &models {
+            for (m, check) in &models {
                 if prog.cancel.load(Relaxed) {
                     break;
                 }
                 *prog.current.lock() = m.name.clone();
+                let verdict = match check {
+                    DupCheck::None => Ok(()),
+                    DupCheck::Stale => Err("已經不算重複了（保留的那份不在清單裡）".to_string()),
+                    DupCheck::Keep(keep) => {
+                        *prog.current.lock() = format!("比對 {} 與保留的那份…", m.name);
+                        crate::models::verify_duplicate(&m.path, keep, &prog.cancel)
+                    }
+                };
+                if let Err(why) = verdict {
+                    prog.log(format!("⚠ 模型 {}：{why}，已略過", m.name));
+                    prog.failed.fetch_add(1, Relaxed);
+                    prog.step.fetch_add(1, Relaxed);
+                    ctx.request_repaint();
+                    continue;
+                }
                 let before = prog.freed.load(Relaxed);
                 let ok = match m.del {
                     crate::models::ModelDel::Dir => cleaner::delete_dir(&m.path, &prog),
@@ -763,8 +818,9 @@ impl App {
         }
         let job = self.an.del_job.take().unwrap();
         if let Some(d) = &mut self.an.data {
-            // 用不跟隨連結的方式確認（壞掉的連結 exists() 也會回傳 false）
-            if std::fs::symlink_metadata(&job.path).is_err() {
+            // 用不跟隨連結的方式確認（壞掉的連結 exists() 也會回傳 false）；
+            // 只有「找不到」才算刪掉，權限或 I/O 錯誤不算
+            if std::fs::symlink_metadata(&job.path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
                 d.tree.mark_deleted(job.node);
                 d.rev += 1;
                 self.an.message = Some(format!("已刪除 {}", job.path.display()));
@@ -799,8 +855,9 @@ impl App {
             if !is_dir && meta.is_some_and(|m| m.1 != req.size && m.0 & win::ATTR_REPARSE == 0) {
                 prog.log("檔案在掃描之後有變動，請重新掃描再刪除");
                 prog.failed.fetch_add(1, Relaxed);
-            } else if cleaner::is_protected(&req.path) {
-                prog.log("這是受保護的位置，不能刪除");
+            } else if let Err(why) = cleaner::precheck(&req.path) {
+                // 永久刪除與移到資源回收筒共用：受保護位置、路徑經過連結、雲端檔
+                prog.log(why);
                 prog.failed.fetch_add(1, Relaxed);
             } else if req.permanent {
                 if is_dir {

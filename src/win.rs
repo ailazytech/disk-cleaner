@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
     FindNextFileW, GetDiskFreeSpaceExW, GetDriveTypeW, GetFileAttributesExW, GetFileExInfoStandard,
-    GetLogicalDrives, GetVolumeInformationW, SetFileAttributesW, WIN32_FILE_ATTRIBUTE_DATA,
+    GetLogicalDrives, GetVolumeInformationW, WIN32_FILE_ATTRIBUTE_DATA,
     WIN32_FIND_DATAW,
 };
 
@@ -159,17 +159,6 @@ pub fn stat(path: &Path) -> Option<(u32, u64, u64)> {
     let size = ((d.nFileSizeHigh as u64) << 32) | d.nFileSizeLow as u64;
     let mtime = ((d.ftLastWriteTime.dwHighDateTime as u64) << 32) | d.ftLastWriteTime.dwLowDateTime as u64;
     Some((d.dwFileAttributes, size, mtime))
-}
-
-/// 只清掉唯讀屬性，保留隱藏、系統等其他屬性。
-pub fn clear_readonly(path: &Path) -> bool {
-    let Some((attrs, _, _)) = stat(path) else { return false };
-    let mut new = attrs & !ATTR_READONLY & !ATTR_DIRECTORY;
-    if new == 0 {
-        new = ATTR_NORMAL;
-    }
-    let p = long_path(path);
-    unsafe { SetFileAttributesW(p.as_ptr(), new) != 0 }
 }
 
 /// 路徑本身是不是 reparse point（junction、symlink…）。不會跟隨連結。
@@ -412,4 +401,227 @@ pub fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// 以 handle 為基礎的刪除：不跟隨連結；握住 handle 的期間，別人不能改名、刪除或替換它
+
+use windows_sys::Win32::Storage::FileSystem as fsys;
+
+pub struct Handle(HANDLE);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SAFETY: 檔案 handle 可以跨執行緒使用
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+/// 從 handle 取得的資訊（不經過路徑，不會被換掉）。
+#[derive(Clone, Copy, Debug)]
+pub struct HInfo {
+    pub attrs: u32,
+    pub size: u64,
+    pub mtime: u64,
+    pub links: u32,
+    pub volume: u32,
+    pub index: u64,
+}
+
+impl HInfo {
+    pub fn is_dir(&self) -> bool {
+        self.attrs & ATTR_DIRECTORY != 0
+    }
+    pub fn is_reparse(&self) -> bool {
+        self.attrs & ATTR_REPARSE != 0
+    }
+    pub fn is_cloud(&self) -> bool {
+        self.attrs & ATTR_CLOUD_MASK != 0
+    }
+}
+
+pub const ERROR_DIR_NOT_EMPTY: i32 = 145;
+
+/// 打開 handle 的用途
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Open {
+    /// 只讀屬性（不影響其他程式，也不擋任何操作）
+    Info,
+    /// 握住資料夾：其他程式不能改名、刪除或替換它
+    Pin,
+    /// 之後要用 [`Handle::delete`] 刪掉它（同時也有 Pin 的效果）
+    Delete,
+}
+
+impl Handle {
+    /// 不跟隨連結地打開檔案或資料夾（連結就打開連結本身）。
+    ///
+    /// 分享模式不含 DELETE。注意：只要求屬性存取權的 handle 不參與分享檢查，
+    /// 所以 Pin 必須要求 FILE_LIST_DIRECTORY，「不讓別人刪除／改名」才會生效。
+    pub fn open(path: &Path, mode: Open) -> io::Result<Handle> {
+        let p = long_path(path);
+        let access = fsys::FILE_READ_ATTRIBUTES
+            | fsys::SYNCHRONIZE
+            | match mode {
+                Open::Info => 0,
+                Open::Pin => fsys::FILE_LIST_DIRECTORY,
+                Open::Delete => fsys::DELETE | fsys::FILE_WRITE_ATTRIBUTES,
+            };
+        let h = unsafe {
+            fsys::CreateFileW(
+                p.as_ptr(),
+                access,
+                fsys::FILE_SHARE_READ | fsys::FILE_SHARE_WRITE,
+                std::ptr::null(),
+                fsys::OPEN_EXISTING,
+                fsys::FILE_FLAG_BACKUP_SEMANTICS | fsys::FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) } else { Ok(Handle(h)) }
+    }
+
+    pub fn info(&self) -> Option<HInfo> {
+        let mut d: fsys::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { fsys::GetFileInformationByHandle(self.0, &mut d) } == 0 {
+            return None;
+        }
+        Some(HInfo {
+            attrs: d.dwFileAttributes,
+            size: ((d.nFileSizeHigh as u64) << 32) | d.nFileSizeLow as u64,
+            mtime: ((d.ftLastWriteTime.dwHighDateTime as u64) << 32) | d.ftLastWriteTime.dwLowDateTime as u64,
+            links: d.nNumberOfLinks,
+            volume: d.dwVolumeSerialNumber,
+            index: ((d.nFileIndexHigh as u64) << 32) | d.nFileIndexLow as u64,
+        })
+    }
+
+    fn clear_readonly(&self) -> bool {
+        let mut b: fsys::FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<fsys::FILE_BASIC_INFO>() as u32;
+        if unsafe { fsys::GetFileInformationByHandleEx(self.0, fsys::FileBasicInfo, &mut b as *mut _ as *mut _, sz) } == 0 {
+            return false;
+        }
+        if b.FileAttributes & ATTR_READONLY == 0 {
+            return true;
+        }
+        b.FileAttributes &= !ATTR_READONLY;
+        if b.FileAttributes == 0 {
+            b.FileAttributes = ATTR_NORMAL;
+        }
+        // 時間欄位填 0 代表不更動
+        b.CreationTime = 0;
+        b.LastAccessTime = 0;
+        b.LastWriteTime = 0;
+        b.ChangeTime = 0;
+        unsafe { fsys::SetFileInformationByHandle(self.0, fsys::FileBasicInfo, &b as *const _ as *const _, sz) != 0 }
+    }
+
+    /// 透過這個 handle 刪除它（檔案、空資料夾，或連結本身）。唯讀屬性一併處理。
+    pub fn delete(&self) -> io::Result<()> {
+        let ex = fsys::FILE_DISPOSITION_INFO_EX {
+            Flags: fsys::FILE_DISPOSITION_FLAG_DELETE
+                | fsys::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | fsys::FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        let ok = unsafe {
+            fsys::SetFileInformationByHandle(
+                self.0,
+                fsys::FileDispositionInfoEx,
+                &ex as *const _ as *const _,
+                std::mem::size_of::<fsys::FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_DIR_NOT_EMPTY) {
+            return Err(err);
+        }
+        // 舊版 Windows 或非 NTFS 不支援 Ex：清掉唯讀後用一般的刪除旗標
+        self.clear_readonly();
+        let d = fsys::FILE_DISPOSITION_INFO { DeleteFile: true };
+        let ok = unsafe {
+            fsys::SetFileInformationByHandle(
+                self.0,
+                fsys::FileDispositionInfo,
+                &d as *const _ as *const _,
+                std::mem::size_of::<fsys::FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    }
+}
+
+/// 從磁碟根目錄下一層開始，逐層不跟隨連結地打開並握住 `dir` 與它的所有上層，
+/// 確認每一層都是真的資料夾、不是連結。回傳的 handles drop 之前，這些資料夾都不能被改名或替換。
+pub fn pin_dir(dir: &Path) -> io::Result<Vec<Handle>> {
+    let mut chain: Vec<&Path> = dir.ancestors().filter(|p| p.parent().is_some()).collect();
+    chain.reverse();
+    let mut out = Vec::with_capacity(chain.len());
+    for p in chain {
+        let h = Handle::open(p, Open::Pin)?;
+        let i = h.info().ok_or_else(io::Error::last_os_error)?;
+        if i.is_reparse() {
+            return Err(io::Error::other(format!("路徑經過連結：{}", p.display())));
+        }
+        if !i.is_dir() {
+            return Err(io::Error::other(format!("不是資料夾：{}", p.display())));
+        }
+        out.push(h);
+    }
+    Ok(out)
+}
+
+/// 檔案的實體身分（磁碟區序號、檔案編號）。同一個檔案用不同路徑（大小寫、硬連結）也會相同。
+pub fn file_id(path: &Path) -> Option<(u32, u64)> {
+    let h = Handle::open(path, Open::Info).ok()?;
+    h.info().map(|i| (i.volume, i.index))
+}
+
+/// 磁碟區的唯一名稱（\?\Volume{GUID}\），同一個磁碟區有多個代號時用來去重。
+pub fn volume_name(root: &str) -> Option<String> {
+    let w = wide(root);
+    let mut buf = [0u16; 64];
+    let ok = unsafe { fsys::GetVolumeNameForVolumeMountPointW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// Known Folder 的實際位置（文件、桌面…被搬到別的磁碟也找得到）。
+pub fn known_folders() -> Vec<PathBuf> {
+    use windows_sys::Win32::UI::Shell as sh;
+    let ids = [
+        sh::FOLDERID_Documents,
+        sh::FOLDERID_Desktop,
+        sh::FOLDERID_Downloads,
+        sh::FOLDERID_Pictures,
+        sh::FOLDERID_Music,
+        sh::FOLDERID_Videos,
+    ];
+    let mut out = Vec::new();
+    for id in ids {
+        let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let hr = unsafe { sh::SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut p) };
+        if hr >= 0 && !p.is_null() {
+            let mut n = 0;
+            unsafe {
+                while *p.add(n) != 0 {
+                    n += 1;
+                }
+                out.push(PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(p, n))));
+            }
+        }
+        if !p.is_null() {
+            unsafe { windows_sys::Win32::System::Com::CoTaskMemFree(p as *const _) };
+        }
+    }
+    out
 }

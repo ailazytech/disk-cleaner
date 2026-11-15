@@ -253,7 +253,9 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
     let locked = row.rule.admin && !elevated;
     let bytes = row.bytes();
     let is_cmd = row.is_command();
-    let can = !locked && (bytes > 0 || is_cmd) && row.measured.is_some();
+    // 資源回收筒裡只有空檔案／空資料夾時大小是 0，但還是可以清
+    let recycle_items = matches!(row.rule.action, crate::rules::Action::RecycleBin) && row.measured.as_ref().is_some_and(|m| m.files > 0);
+    let can = !locked && (bytes > 0 || is_cmd || recycle_items) && row.measured.is_some();
     let why = row.rule.why();
 
     // 右欄要顯示的東西先算好（左右兩個閉包不能同時借用 row）
@@ -602,6 +604,7 @@ fn models_section(app: &mut App, ui: &mut egui::Ui) {
                     for m in models.iter_mut() {
                         if m.m.source == *src {
                             m.checked = !*all;
+                            m.via_dup = false;
                         }
                     }
                 }
@@ -611,11 +614,13 @@ fn models_section(app: &mut App, ui: &mut egui::Ui) {
             if dup_bytes > 0 && ui.small_button(format!("勾選重複的（每組保留最新一份，可省 {}）", fmt::size(dup_bytes))).clicked() {
                 for (m, d) in models.iter_mut().zip(&dups) {
                     m.checked = d.is_some();
+                    m.via_dup = d.is_some();
                 }
             }
             if ui.small_button("全不選").clicked() {
                 for m in models.iter_mut() {
                     m.checked = false;
+                    m.via_dup = false;
                 }
             }
         });
@@ -637,7 +642,9 @@ fn models_section(app: &mut App, ui: &mut egui::Ui) {
                         theme::right_cell(ui, AGE_W, &age, FontId::proportional(12.0), DIM);
                     },
                     |ui| {
-                        theme::check(ui, &mut m.checked);
+                        if theme::check(ui, &mut m.checked).changed() {
+                            m.via_dup = false;
+                        }
                         theme::suggest_slot(ui, is_dup && !m.checked, &why);
                         if ui.small_button("📂").on_hover_text("在檔案總管中顯示").clicked() {
                             win::reveal_in_explorer(&m.m.path);

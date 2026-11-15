@@ -313,6 +313,77 @@ fn selftest() -> bool {
         check(name, cond);
     }
 
+    // 10. 第二輪審查（Codex gpt-6.1-sol）
+    // 10a. 握住的資料夾與它的上層都不能被改名（刪除途中不能被換成 junction）
+    let pin_root = base.join("pin");
+    let pin_dir = pin_root.join("inner");
+    fs::create_dir_all(&pin_dir).unwrap();
+    let pins = win::pin_dir(&pin_dir);
+    check("握住期間資料夾不能被改名", pins.is_ok() && fs::rename(&pin_dir, pin_root.join("moved")).is_err());
+    check("握住期間上層資料夾也不能被改名", fs::rename(&pin_root, base.join("pin2")).is_err());
+    drop(pins);
+    check("放開之後可以改名", fs::rename(&pin_dir, pin_root.join("moved")).is_ok());
+    check("路徑經過 junction 時無法握住", win::pin_dir(&link_target).is_err());
+
+    // 10b. 有其他硬連結的檔案：刪掉一個連結不會釋放空間，不能算進去
+    let hl = base.join("hardlinks");
+    w(&hl.join("target").join("linked.bin"), &"h".repeat(3000));
+    w(&hl.join("target").join("solo.bin"), "solo");
+    fs::hard_link(hl.join("target").join("linked.bin"), hl.join("elsewhere.bin")).unwrap();
+    let dp6 = cleaner::DelProgress::default();
+    cleaner::delete_children(&hl.join("target"), u64::MAX, &dp6);
+    check("硬連結檔案不計入釋放空間", dp6.freed.load(std::sync::atomic::Ordering::Relaxed) == 4 && hl.join("elsewhere.bin").exists());
+
+    // 10c. 有時間條件時，剛建立的空資料夾保留
+    let td2 = base.join("tempdir2");
+    fs::create_dir_all(td2.join("fresh_empty")).unwrap();
+    let dp7 = cleaner::DelProgress::default();
+    cleaner::delete_children(&td2, cleaner::cutoff(1), &dp7);
+    check("剛建立的空資料夾保留", td2.join("fresh_empty").exists());
+
+    // 10d. 分析頁的共用前置檢查（移到資源回收筒也走這裡）
+    check("經過 junction 的路徑拒絕回收", cleaner::precheck(&link_target.join("precious.txt")).is_err() && real.join("precious.txt").exists());
+    check("一般檔案通過前置檢查", cleaner::precheck(&keep.join("important.txt")).is_ok());
+
+    // 10e. 產物判斷順序：venv 先判斷；裡面有專案定義檔就不算
+    let ord = base.join("order");
+    w(&ord.join("a").join("Cargo.toml"), "[package]");
+    w(&ord.join("a").join("target").join("pyvenv.cfg"), "home = x");
+    w(&ord.join("a").join("target").join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55");
+    w(&ord.join("b").join("Cargo.toml"), "[package]");
+    w(&ord.join("b").join("target").join("Cargo.toml"), "[package]");
+    w(&ord.join("b").join("target").join("src").join("main.rs"), "fn main(){}");
+    w(&ord.join("c").join("package.json"), "{}");
+    w(&ord.join("c").join(".next").join("package.json"), "{\"type\":\"commonjs\"}");
+    check("名叫 target 的 venv 判定為虛擬環境", projects::revalidate(&ord.join("a").join("target")).is_some_and(|k| k.id == "venv"));
+    check("target 裡是另一個 Cargo 專案就不算", projects::revalidate(&ord.join("b").join("target")).is_none());
+    check(".next 裡有 package.json 仍算前端快取", projects::revalidate(&ord.join("c").join(".next")).is_some_and(|k| k.id == "web"));
+
+    // 10f. Ollama：其他 manifest 不完整、或 digest 大小寫不同，都不能誤刪共用 blob
+    let d_shared = format!("sha256:{}", "c".repeat(64));
+    let d_own = format!("sha256:{}", "d".repeat(64));
+    let d_shared_upper = format!("sha256:{}", "C".repeat(64));
+    w(&lib.join("gamma").join("1b"), &man(&[(d_shared.as_str(), 6), (d_own.as_str(), 4)]));
+    w(&lib.join("delta").join("latest"), &man(&[(d_shared_upper.as_str(), 6)]));
+    w(&om.join("blobs").join(d_shared.replace(':', "-")), "shared");
+    w(&om.join("blobs").join(d_own.replace(':', "-")), "gggg");
+    w(&lib.join("half").join("latest"), "{\"layers\":[{\"digest\":\"sha256:");
+    check("其他 manifest 不完整時不刪", models::delete_ollama(&lib.join("gamma").join("1b")).is_err() && lib.join("gamma").join("1b").exists());
+    fs::remove_file(lib.join("half").join("latest")).unwrap();
+    fs::remove_file(&evil).unwrap();
+    let freed = models::delete_ollama(&lib.join("gamma").join("1b"));
+    check("digest 大小寫不同仍視為共用", freed == Ok(4) && om.join("blobs").join(d_shared.replace(':', "-")).exists());
+
+    // 10g. 重複模型：同名同大小但內容不同、或其實是同一個檔案，都不能刪
+    let md = base.join("models");
+    w(&md.join("a").join("model.safetensors"), "AAAAAAAA");
+    w(&md.join("b").join("model.safetensors"), "AAAAAAAA");
+    w(&md.join("c").join("model.safetensors"), "BBBBBBBB");
+    let cancel2 = AtomicBool::new(false);
+    check("內容相同才算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("b").join("model.safetensors"), &cancel2).is_ok());
+    check("同名同大小但內容不同不算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("c").join("model.safetensors"), &cancel2).is_err());
+    check("同一個檔案（大小寫不同）不算重複", models::verify_duplicate(&md.join("a").join("model.safetensors"), &md.join("A").join("MODEL.safetensors"), &cancel2).is_err());
+
     let _ = fs::remove_dir_all(&base);
     println!("{}", if ok { "全部通過" } else { "有測試失敗" });
     ok

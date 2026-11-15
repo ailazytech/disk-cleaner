@@ -191,27 +191,82 @@ fn blob_file(models: &Path, digest: &str) -> Option<PathBuf> {
     valid_digest(digest).then(|| models.join("blobs").join(digest.replace(':', "-")))
 }
 
+/// 從其他 manifest 找出「可能被參照」的 digest：檔案裡任何長得像 digest 的字串都算（寧可多算）。
+/// 統一成小寫：NTFS 檔名不分大小寫，`sha256:ABC…` 和 `sha256:abc…` 是同一個 blob。
+fn referenced_digests(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':')).filter(|t| valid_digest(t)).map(|t| t.to_ascii_lowercase())
+}
+
+/// JSON 結構是否完整（大括號、中括號成對，字串有結束）。寫到一半或被截斷的 manifest 會回傳 false。
+fn json_complete(text: &str) -> bool {
+    let t = text.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return false;
+    }
+    let mut stack = Vec::new();
+    let (mut in_str, mut esc) = (false, false);
+    for c in t.chars() {
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, '\\') => esc = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' | '[' => stack.push(c),
+            '}' if stack.pop() != Some('{') => return false,
+            ']' if stack.pop() != Some('[') => return false,
+            _ => {}
+        }
+    }
+    !in_str && stack.is_empty()
+}
+
 /// 所有 manifest：(檔案路徑, 模型名稱)。不跟隨連結。
 fn ollama_manifests() -> Vec<(PathBuf, String)> {
-    let Some(models) = ollama_dir() else { return Vec::new() };
+    list_manifests(false).unwrap_or_default().into_iter().filter(|(_, name)| !name.is_empty()).collect()
+}
+
+/// strict：列舉失敗、遇到連結、資料夾太深都回傳錯誤，而且連不像 manifest 的檔案也列出（名稱留空）。
+/// 刪 blob 之前要確定「其他模型用到哪些 blob」的清單是完整的。
+fn list_manifests(strict: bool) -> Result<Vec<(PathBuf, String)>, String> {
+    let models = ollama_dir().ok_or("找不到 Ollama 模型資料夾")?;
     let root = models.join("manifests");
     if win::has_reparse_on_path(&root) {
-        return Vec::new();
+        return Err("manifest 資料夾經過連結".into());
     }
     let mut out = Vec::new();
-    fn rec(dir: &Path, comps: &mut Vec<String>, out: &mut Vec<(PathBuf, String)>) {
+    fn rec(dir: &Path, comps: &mut Vec<String>, out: &mut Vec<(PathBuf, String)>, strict: bool) -> Result<(), String> {
         let mut ents = Vec::new();
-        let _ = win::list_dir(dir, |e| ents.push((e.name_os().to_string_lossy().into_owned(), e.is_dir(), e.is_reparse())));
+        let r = win::list_dir(dir, |e| ents.push((e.name_os().to_string_lossy().into_owned(), e.is_dir(), e.is_reparse())));
+        if let Err(e) = r
+            && strict
+        {
+            return Err(format!("無法列出 {}：{e}", dir.display()));
+        }
         for (name, is_dir, reparse) in ents {
             if reparse {
+                if strict {
+                    return Err(format!("manifest 資料夾裡有連結：{}", dir.join(&name).display()));
+                }
                 continue;
             }
             comps.push(name.clone());
             if is_dir {
                 if comps.len() < 16 {
-                    rec(&dir.join(&name), comps, out);
+                    rec(&dir.join(&name), comps, out, strict)?;
+                } else if strict {
+                    return Err(format!("manifest 資料夾太深：{}", dir.join(&name).display()));
                 }
-            } else if comps.len() >= 3 {
+            } else if comps.len() < 3 {
+                if strict {
+                    out.push((dir.join(&name), String::new()));
+                }
+            } else {
                 // registry / namespace / model / tag
                 let n = comps.len();
                 let (model, tag) = (&comps[n - 2], &comps[n - 1]);
@@ -225,9 +280,10 @@ fn ollama_manifests() -> Vec<(PathBuf, String)> {
             }
             comps.pop();
         }
+        Ok(())
     }
-    rec(&root, &mut Vec::new(), &mut out);
-    out
+    rec(&root, &mut Vec::new(), &mut out, strict)?;
+    Ok(out)
 }
 
 fn ollama(out: &mut Vec<Model>) {
@@ -253,7 +309,8 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// 刪除 Ollama 模型：移除 manifest，再刪掉沒有其他 manifest 參照的 blob。回傳釋放的位元組數。
-/// 任何一個其他模型的 manifest 讀不到、manifest 不在 Ollama 目錄裡、digest 格式不對，都直接中止（不刪）。
+/// 「其他模型用到哪些 blob」只要有一點不確定（資料夾列不出來、有連結、太深、manifest 讀不到或不完整），
+/// 就整個不刪。其他 manifest 裡任何長得像 digest 的字串都當成有參照。
 pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
     let models = ollama_dir().ok_or("找不到 Ollama 模型資料夾")?;
     let blobs = models.join("blobs");
@@ -267,38 +324,47 @@ pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
     }
     let text = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let mine: Vec<String> = manifest_layers(&text).into_iter().map(|x| x.0).collect();
-    if mine.is_empty() || mine.iter().any(|d| !valid_digest(d)) {
+    if !json_complete(&text) || mine.is_empty() || mine.iter().any(|d| !valid_digest(d)) {
         return Err("manifest 內容格式不對，為了安全不刪".into());
     }
+    let all = list_manifests(true).map_err(|e| format!("{e}，無法確認其他模型用到哪些檔案，為了安全不刪"))?;
     let mut others: HashSet<String> = HashSet::new();
     let mut found_self = false;
-    for (p, _) in ollama_manifests() {
+    for (p, _) in all {
         if same_path(&p, manifest) {
             found_self = true;
             continue;
         }
         let t = std::fs::read_to_string(&p).map_err(|e| format!("讀不到其他模型的 manifest（{}）：{e}，為了安全不刪", p.display()))?;
-        others.extend(manifest_layers(&t).into_iter().map(|x| x.0));
+        if !json_complete(&t) {
+            return Err(format!("其他模型的 manifest 不完整（{}），可能正在下載或寫入，為了安全不刪", p.display()));
+        }
+        others.extend(referenced_digests(&t));
     }
     if !found_self {
         return Err("在 Ollama 模型清單裡找不到這個 manifest，已略過".into());
     }
+    // 握住 blobs 與所有上層：刪除途中不能被換成連結
+    let _pins = win::pin_dir(&blobs).map_err(|e| format!("blobs 資料夾無法鎖定（{e}），為了安全不刪"))?;
     std::fs::remove_file(manifest).map_err(|e| e.to_string())?;
     let mut freed = 0;
+    let mut done = HashSet::new();
     for d in mine {
-        if others.contains(&d) {
+        let d = d.to_ascii_lowercase();
+        if others.contains(&d) || !done.insert(d.clone()) {
             continue;
         }
         let Some(b) = blob_file(&models, &d) else { continue };
         if !b.parent().is_some_and(|p| same_path(p, &blobs)) {
             continue;
         }
-        let Some((attrs, size, _)) = win::stat(&b) else { continue };
-        if attrs & (win::ATTR_DIRECTORY | win::ATTR_REPARSE) != 0 {
+        let Ok(h) = win::Handle::open(&b, win::Open::Delete) else { continue };
+        let Some(i) = h.info() else { continue };
+        if i.is_dir() || i.is_reparse() || i.is_cloud() {
             continue;
         }
-        if std::fs::remove_file(&b).is_ok() {
-            freed += size;
+        if h.delete().is_ok() && i.links <= 1 {
+            freed += i.size;
         }
     }
     Ok(freed)
@@ -338,6 +404,49 @@ pub fn find_known(cancel: &AtomicBool) -> Vec<Model> {
 
 /// 去除重複路徑
 pub fn dedup(v: &mut Vec<Model>) {
-    let mut seen: HashMap<PathBuf, ()> = HashMap::new();
-    v.retain(|m| seen.insert(m.path.clone(), ()).is_none());
+    // 路徑不分大小寫：同一個檔案用不同大小寫加進來，不能被當成兩份
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    v.retain(|m| seen.insert(m.path.to_string_lossy().to_lowercase(), ()).is_none());
+}
+
+/// 刪「重複的模型」之前確認：保留的那份還在、和要刪的不是同一個實體檔案（大小寫不同的路徑、硬連結），
+/// 而且逐位元組內容完全相同。只比對檔名和大小不夠：同架構的不同微調結果大小常常一模一樣。
+pub fn verify_duplicate(del: &Path, keep: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    use std::io::Read;
+    let id_del = win::file_id(del).ok_or("讀不到要刪的檔案")?;
+    let id_keep = win::file_id(keep).ok_or_else(|| format!("保留的那份（{}）不見了", keep.display()))?;
+    if id_del == id_keep {
+        return Err(format!("和 {} 其實是同一個檔案", keep.display()));
+    }
+    let mut a = std::fs::File::open(del).map_err(|e| e.to_string())?;
+    let mut b = std::fs::File::open(keep).map_err(|e| e.to_string())?;
+    let (la, lb) = (a.metadata().map_err(|e| e.to_string())?.len(), b.metadata().map_err(|e| e.to_string())?.len());
+    if la != lb {
+        return Err(format!("和 {} 大小不同", keep.display()));
+    }
+    const CHUNK: usize = 8 << 20;
+    let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        let n = read_full(&mut a, &mut ba).map_err(|e| e.to_string())?;
+        let m = read_full(&mut b, &mut bb).map_err(|e| e.to_string())?;
+        if n != m || ba[..n] != bb[..m] {
+            return Err(format!("和 {} 內容不同，不是重複檔", keep.display()));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+    }
+    fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            match f.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
+        Ok(n)
+    }
 }
