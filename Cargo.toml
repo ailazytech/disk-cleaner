@@ -18,7 +18,7 @@ lz4_flex = "0.14"
 parking_lot = "0.12"
 rayon = "1.12.0"
 rfd = "0.18"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_Globalization", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_Globalization", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_Registry", "Win32_System_EventLog"] }
 
 [dev-dependencies]
 tiny-skia = "0.11"

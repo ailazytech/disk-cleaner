@@ -2,6 +2,7 @@
 
 mod anim;
 mod app;
+mod boot;
 mod cache;
 mod cleaner;
 mod fmt;
@@ -20,6 +21,7 @@ mod theme;
 mod tree;
 mod treemap;
 mod ui_analyze;
+mod ui_boot;
 mod ui_clean;
 mod ui_dash;
 mod win;
@@ -376,6 +378,9 @@ fn selftest() -> bool {
     for (name, cond) in mft::selftest() {
         check(name, cond);
     }
+    for (name, cond) in boot::selftest() {
+        check(name, cond);
+    }
 
     // 10. 第二輪審查（Codex gpt-6.1-sol）
     // 10a. 握住的資料夾與它的上層都不能被改名（刪除途中不能被換成 junction）
@@ -629,6 +634,7 @@ fn main() {
                 Some("clean") => a.tab = app::Tab::Clean,
                 Some("analyze") => a.tab = app::Tab::Analyze,
                 Some("dash") => a.tab = app::Tab::Dash,
+                Some("boot") => a.tab = app::Tab::Boot,
                 _ => {}
             }
             // --demo-clean：只模擬清理進度（截圖、看動畫用），不會刪任何東西

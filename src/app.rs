@@ -19,13 +19,23 @@ use crate::tree::{Kind, Stats, Tree};
 use crate::treemap::Tile;
 use crate::win::{self, DriveInfo};
 use crate::summary::DriveSummary;
-use crate::{fmt, ui_analyze, ui_clean, ui_dash};
+use crate::{fmt, ui_analyze, ui_boot, ui_clean, ui_dash};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dash,
     Clean,
     Analyze,
+    Boot,
+}
+
+/// 開機加速分頁
+#[derive(Default)]
+pub struct BootState {
+    pub data: Option<crate::boot::BootData>,
+    pub job: Option<crossbeam_channel::Receiver<crate::boot::BootData>>,
+    /// （訊息, 是不是錯誤）
+    pub msg: Option<(String, bool)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +240,7 @@ pub struct App {
     pub clean: CleanState,
     pub an: AnalyzeState,
     pub dash: DashState,
+    pub boot: BootState,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +348,7 @@ impl App {
                 hover: None,
                 pending_focus: None,
             },
+            boot: BootState::default(),
         };
         app.load_result_caches();
         app.start_measure(&cc.egui_ctx, None);
@@ -526,6 +538,17 @@ impl App {
             }
         }
         (b, n)
+    }
+
+    /// 開機加速分頁：在背景讀開機記錄、啟動項目與系統設定
+    pub fn start_boot_load(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.boot.job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::boot::load());
+            ctx.request_repaint();
+        });
     }
 
     /// 只用來截圖、看動畫：模擬一次清理的進度。只改進度數字，不會刪除或碰任何檔案。
@@ -986,6 +1009,7 @@ impl App {
             tab(ui, &mut self.tab, Tab::Dash, "  儀表板  ");
             tab(ui, &mut self.tab, Tab::Clean, "  清理  ");
             tab(ui, &mut self.tab, Tab::Analyze, "  磁碟分析  ");
+            tab(ui, &mut self.tab, Tab::Boot, "  開機加速  ");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.elevated {
                     ui.label(RichText::new("🛡 系統管理員").color(crate::theme::GREEN))
@@ -1039,6 +1063,7 @@ impl eframe::App for App {
             Tab::Dash => ui_dash::show(self, ui),
             Tab::Clean => ui_clean::show(self, ui),
             Tab::Analyze => ui_analyze::show(self, ui),
+            Tab::Boot => ui_boot::show(self, ui),
         }
 
         if self.busy() {
