@@ -411,8 +411,9 @@ fn selftest() -> bool {
     fs::create_dir_all(&longdir).unwrap();
     let short = short_path(&longdir).unwrap_or_else(|| longdir.clone());
     let real = win::pin_dir(&short).ok().and_then(|v| v.last().and_then(|h| h.real_path()));
-    check("短檔名會換成實際長路徑", real.is_some_and(|r| r.to_string_lossy().to_lowercase() == longdir.to_string_lossy().to_lowercase()));
-    check("不接受磁碟根目錄", win::pin_dir(Path::new("C:\\")).is_err());
+    // 期望值要用完全展開的長路徑：暫存資料夾本身可能就是短檔名（例如 CI 的 C:\Users\RUNNER~1）
+    let expect = win::final_path(&longdir).unwrap_or_else(|| longdir.clone());
+    check("短檔名會換成實際長路徑", real.is_some_and(|r| r.to_string_lossy().to_lowercase() == expect.to_string_lossy().to_lowercase()));    check("不接受磁碟根目錄", win::pin_dir(Path::new("C:\\")).is_err());
 
     // 11c. 資料夾裡有雲端檔（以 OFFLINE 屬性模擬）：回收前要擋，清理時要略過
     let cd = base.join("cloudy");
