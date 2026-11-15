@@ -759,12 +759,17 @@ fn time_created(xml: &str) -> Option<u64> {
     u64::try_from((secs + 11_644_473_600) * 10_000_000).ok()
 }
 
-/// 回傳（事件 XML, 是否完整讀完）。查詢本身失敗回傳錯誤碼。
+/// 開機效能記錄（要系統管理員）
 fn query_events(query: &str, max: usize) -> Result<(Vec<String>, bool), u32> {
+    query_events_in("Microsoft-Windows-Diagnostics-Performance/Operational", query, max)
+}
+
+/// 從新到舊讀某個事件記錄。回傳（事件 XML, 是否完整讀完）。查詢本身失敗回傳錯誤碼。
+fn query_events_in(channel: &str, query: &str, max: usize) -> Result<(Vec<String>, bool), u32> {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::EventLog::{EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EvtRender, EvtRenderEventXml};
     const NO_MORE_ITEMS: u32 = 259;
-    let path = win::wide("Microsoft-Windows-Diagnostics-Performance/Operational");
+    let path = win::wide(channel);
     let q = win::wide(query);
     let h = unsafe { EvtQuery(0, path.as_ptr(), q.as_ptr(), EvtQueryChannelPath | EvtQueryReverseDirection) };
     if h == 0 {
@@ -917,6 +922,117 @@ pub struct SysCheck {
     pub sys_ssd: Option<bool>,
     /// 例如「Windows 10 Pro 22H2（組建 19045）」，給「問 AI」的提問用
     pub os: String,
+    /// 最近幾次開機的韌體（BIOS／UEFI）時間，舊到新
+    pub firmware: Vec<FwBoot>,
+    pub board: Board,
+}
+
+/// 一次開機的韌體時間（Kernel-Boot 事件 30「韌體已回報開機衡量標準」，一般權限讀得到）
+#[derive(Clone, Debug, PartialEq)]
+pub struct FwBoot {
+    pub when: u64,
+    /// 按下電源到開始執行 Windows 開機管理程式（StartOSImageStart，和工作管理員的「上次 BIOS 時間」相同）
+    pub firmware_ms: u32,
+    /// Windows 開機管理程式到核心接手（ExitBootServicesEntry − StartOSImageStart）
+    pub loader_ms: u32,
+    /// Kernel-Boot 事件 27：0＝完整開機、1＝快速啟動、2＝從休眠恢復
+    pub boot_type: Option<u32>,
+}
+
+impl FwBoot {
+    pub fn kind(&self) -> &'static str {
+        match self.boot_type {
+            Some(0) => "完整開機",
+            Some(1) => "快速啟動",
+            Some(2) => "從休眠恢復",
+            _ => "開機",
+        }
+    }
+}
+
+/// 主機板與韌體資訊（HKLM\HARDWARE\DESCRIPTION\System\BIOS，一般權限讀得到）
+#[derive(Clone, Debug, Default)]
+pub struct Board {
+    pub maker: String,
+    pub product: String,
+    pub bios_version: String,
+    pub bios_date: String,
+    /// UEFI 開機（false＝傳統 BIOS）；None＝查不到
+    pub uefi: Option<bool>,
+    /// 安全開機有沒有開；None＝查不到
+    pub secure_boot: Option<bool>,
+}
+
+impl Board {
+    pub fn summary(&self) -> String {
+        let mut s = format!("{} {}", self.maker, self.product).trim().to_string();
+        if !self.bios_version.is_empty() {
+            s += &format!("，BIOS {}", self.bios_version);
+            if !self.bios_date.is_empty() {
+                s += &format!("（{}）", self.bios_date);
+            }
+        }
+        s
+    }
+}
+
+fn board_info() -> Board {
+    use windows_sys::Win32::System::SystemInformation::GetFirmwareType;
+    let mut b = Board::default();
+    if let Some(k) = open_key(HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS", KEY_QUERY_VALUE) {
+        let s = |n: &str| query(&k, n).filter(|(t, _)| *t == REG_SZ).map(|(_, d)| from_wide_bytes(&d).trim().to_string()).unwrap_or_default();
+        b.maker = s("BaseBoardManufacturer");
+        b.product = s("BaseBoardProduct");
+        if b.product.is_empty() {
+            b.maker = s("SystemManufacturer");
+            b.product = s("SystemProductName");
+        }
+        b.bios_version = s("BIOSVersion");
+        b.bios_date = s("BIOSReleaseDate");
+    }
+    let mut t = 0;
+    if unsafe { GetFirmwareType(&mut t) } != 0 {
+        // FirmwareTypeBios = 1、FirmwareTypeUefi = 2
+        b.uefi = match t {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        };
+    }
+    b.secure_boot = read_dword(HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\SecureBoot\State", "UEFISecureBootEnabled").map(|v| v != 0);
+    b
+}
+
+/// 事件 30 的韌體時間（讀不到 StartOSImageStart 的回傳 None）
+fn parse_fw_event(x: &str) -> Option<FwBoot> {
+    let firmware = data_field(x, "StartOSImageStart")?.trim().parse::<u32>().ok()?;
+    let exit = data_field(x, "ExitBootServicesEntry").and_then(|v| v.trim().parse::<u32>().ok());
+    Some(FwBoot {
+        when: time_created(x).unwrap_or(0),
+        firmware_ms: firmware,
+        loader_ms: exit.map_or(0, |e| e.saturating_sub(firmware)),
+        boot_type: None,
+    })
+}
+
+/// 最近 30 次開機的韌體時間（舊到新），配上同一次開機的開機類型（事件 27，時間相差 10 秒內）
+fn firmware_boots() -> Vec<FwBoot> {
+    const SYS: &str = "System";
+    let q = |id: u32| format!("*[System[Provider[@Name='Microsoft-Windows-Kernel-Boot'] and (EventID={id})]]");
+    let Ok((xs, _)) = query_events_in(SYS, &q(30), 30) else { return Vec::new() };
+    let types: Vec<(u64, u32)> = query_events_in(SYS, &q(27), 60)
+        .map(|(v, _)| v.iter().filter_map(|x| Some((time_created(x)?, data_field(x, "BootType")?.trim().parse().ok()?))).collect())
+        .unwrap_or_default();
+    let mut out: Vec<FwBoot> = xs
+        .iter()
+        .filter_map(|x| parse_fw_event(x))
+        .map(|mut f| {
+            f.boot_type = types.iter().filter(|(t, _)| t.abs_diff(f.when) <= 10 * 10_000_000).min_by_key(|(t, _)| t.abs_diff(f.when)).map(|(_, b)| *b);
+            f
+        })
+        .collect();
+    out.sort_by_key(|f| f.when);
+    out
 }
 
 /// Windows 版本名稱。Windows 11 的 ProductName 仍然寫 Windows 10，要看組建編號。
@@ -997,6 +1113,8 @@ pub fn sys_check() -> SysCheck {
         sys_total: info.as_ref().map_or(0, |d| d.total),
         sys_ssd: seek_penalty(letter).map(|p| !p),
         os: os_name(),
+        firmware: firmware_boots(),
+        board: board_info(),
     }
 }
 
@@ -1298,6 +1416,23 @@ pub fn demo() -> BootData {
         sys_total: 1024 << 30,
         sys_ssd: Some(true),
         os: "Windows 10 Pro 22H2（組建 19045）".into(),
+        // 前 12 次約 11 秒，最後 3 次改了 BIOS 設定後約 6 秒
+        firmware: (0..15u64)
+            .map(|i| FwBoot {
+                when: now - (15 - i) * day,
+                firmware_ms: if i < 12 { 10_700 + (i as u32 % 4) * 230 } else { 5_900 + (i as u32 % 3) * 150 },
+                loader_ms: 2_100,
+                boot_type: Some(if i % 3 == 0 { 0 } else { 1 }),
+            })
+            .collect(),
+        board: Board {
+            maker: "Demo Corp".into(),
+            product: "Z590 DEMO".into(),
+            bios_version: "0820".into(),
+            bios_date: "04/27/2021".into(),
+            uefi: Some(true),
+            secure_boot: Some(false),
+        },
     };
     // OneDrive 示範成已延後；優化記錄裡有它和一個停用的項目、一個停用的排程工作
     items[1].enabled = false;
@@ -1432,6 +1567,15 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         ("開機記錄：事件編號", event_id(xml) == Some(100)),
         ("開機記錄：時間換算", time_created(xml) == Some(expect)),
         ("開機記錄：截斷的 XML 不會當掉", time_created("<x SystemTime='2026").is_none()),
+        (
+            "開機記錄：韌體時間（事件 30）",
+            parse_fw_event(
+                "<Event><System><EventID>30</EventID><TimeCreated SystemTime='2026-11-15T01:02:03.0Z'/></System><EventData>\
+                 <Data Name='ResetEndStart'>249</Data><Data Name='LoadOSImageStart'>10983</Data><Data Name='StartOSImageStart'>10987</Data>\
+                 <Data Name='ExitBootServicesEntry'>13095</Data></EventData></Event>",
+            ) == Some(FwBoot { when: expect, firmware_ms: 10_987, loader_ms: 2_108, boot_type: None })
+                && parse_fw_event("<Event><EventData><Data Name='ResetEndStart'>1</Data></EventData></Event>").is_none(),
+        ),
         ("啟動項目：引號裡的執行檔", resolve_exe(r#""C:\Program Files\X\x.exe" -silent"#).0 == Some(PathBuf::from(r"C:\Program Files\X\x.exe"))),
         (
             "啟動項目：沒有引號、路徑有空白",

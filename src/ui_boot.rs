@@ -230,6 +230,38 @@ fn boot_time_card(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// 最近幾次開機的長條圖：深色是到桌面出現，淺色是桌面出現後還在忙
+/// 韌體時間的顏色：6 秒內正常、10 秒內偏慢、更久算慢
+fn fw_color(ms: u32) -> Color32 {
+    match ms {
+        0..=6_000 => GREEN,
+        6_001..=10_000 => ORANGE,
+        _ => RED,
+    }
+}
+
+/// 最近 15 次開機的韌體時間（小長條，舊到新）；滑鼠移上去看那一次
+fn fw_bars(ui: &mut egui::Ui, list: &[boot::FwBoot]) {
+    let shown: Vec<_> = list.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect();
+    let (bw, gap, h) = (7.0, 3.0, 20.0);
+    let w = shown.len() as f32 * (bw + gap);
+    let (rect, _) = ui.allocate_exact_size(vec2(w.max(1.0), h), Sense::hover());
+    let max = shown.iter().map(|f| f.firmware_ms).max().unwrap_or(1).max(12_000) as f32;
+    for (i, f) in shown.iter().enumerate() {
+        let x = rect.left() + i as f32 * (bw + gap);
+        let bh = (f.firmware_ms as f32 / max * h).max(2.0);
+        let r = egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - bh), egui::pos2(x + bw, rect.bottom()));
+        let last = i + 1 == shown.len();
+        ui.painter().rect_filled(r, 2, theme::with_alpha(fw_color(f.firmware_ms), if last { 230 } else { 140 }));
+        ui.interact(r.expand2(vec2(gap / 2.0, 2.0)), ui.id().with(("fwbar", i)), Sense::hover()).on_hover_text(format!(
+            "{}（{}）\nBIOS／UEFI {}\nWindows 開機管理程式 {}",
+            fmt::ago(f.when),
+            f.kind(),
+            secs(f.firmware_ms),
+            secs(f.loader_ms)
+        ));
+    }
+}
+
 fn boot_bars(ui: &mut egui::Ui, boots: &[boot::BootRecord]) {
     let shown: Vec<_> = boots.iter().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect();
     let h = 80.0;
@@ -338,6 +370,35 @@ fn sys_card(app: &mut App, ui: &mut egui::Ui) {
             None => ("查不到", DIM, "查不到磁碟類型。"),
         };
         row(ui, "系統磁碟類型", RichText::new(dt).color(dc), dh, &mut |_| {});
+        // BIOS／UEFI：按下電源到交給 Windows 的時間（每次開機都有記錄，一般權限讀得到）
+        if let Some(last) = sys.firmware.last() {
+            let recent: Vec<_> = sys.firmware.iter().rev().take(10).collect();
+            let avg = (recent.iter().map(|f| f.firmware_ms as u64).sum::<u64>() / recent.len().max(1) as u64) as u32;
+            let col = fw_color(last.firmware_ms);
+            let b = &sys.board;
+            let mut hover = format!(
+                "按下電源到主機板把控制權交給 Windows 的時間（工作管理員的「上次 BIOS 時間」；Windows 的開機時間記錄不包含這一段）。\n\
+                 最近一次 {}（{}），最近 {} 次平均 {}。",
+                secs(last.firmware_ms),
+                last.kind(),
+                recent.len(),
+                secs(avg)
+            );
+            if !b.summary().is_empty() {
+                hover += &format!("\n主機板：{}", b.summary());
+            }
+            hover += "\n\n這一段只跟主機板的設定與韌體有關，在 Windows 裡改不了。偏慢時常見的加快方法（在開機時按 Del 或 F2 進 BIOS 設定）：\
+                      \n・開啟 Fast Boot（跳過每次完整的硬體檢查）\
+                      \n・關閉開機畫面的等待時間（Boot Logo／POST Delay）";
+            if b.uefi == Some(true) {
+                hover += "\n・關閉 CSM（相容性支援模組）：這台電腦是用 UEFI 開機，關掉不影響開進 Windows";
+                if b.secure_boot == Some(false) {
+                    hover += "（安全開機目前沒開，常見原因就是 CSM 開著）";
+                }
+            }
+            hover += "\n・到主機板廠商的網站更新 BIOS\n改完之後，右邊的長條會顯示下一次開機的時間，可以直接比較。";
+            row(ui, "BIOS／UEFI", RichText::new(secs(last.firmware_ms)).color(col), &hover, &mut |ui| fw_bars(ui, &sys.firmware));
+        }
         // 啟動項目數量
         let many = enabled > 12;
         row(

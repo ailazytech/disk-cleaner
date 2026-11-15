@@ -748,6 +748,35 @@ pub fn full_report(d: &BootData) -> String {
             None => "查不到",
         }
     );
+    let b = &d.sys.board;
+    if !b.summary().is_empty() {
+        s += &format!("- 主機板：{}\n", b.summary());
+    }
+    s += &format!(
+        "- 韌體：{}；安全開機：{}\n",
+        match b.uefi {
+            Some(true) => "UEFI",
+            Some(false) => "傳統 BIOS",
+            None => "查不到",
+        },
+        match b.secure_boot {
+            Some(true) => "開",
+            Some(false) => "關",
+            None => "查不到",
+        }
+    );
+    if let Some(last) = d.sys.firmware.last() {
+        let recent: Vec<_> = d.sys.firmware.iter().rev().take(10).collect();
+        let avg = recent.iter().map(|f| f.firmware_ms as u64).sum::<u64>() / recent.len().max(1) as u64;
+        s += &format!(
+            "- BIOS／UEFI 階段（按下電源到交給 Windows 開機管理程式）：最近一次 {}（{}），最近 {} 次平均 {}；之後 Windows 開機管理程式約 {}\n",
+            secs(last.firmware_ms as u64),
+            last.kind(),
+            recent.len(),
+            secs(avg),
+            secs(last.loader_ms as u64)
+        );
+    }
 
     // 開機自動啟動：指令相同的合成一筆（和畫面上的分組相同），代表那筆優先用啟用中的
     let mut done = vec![false; d.items.len()];
@@ -913,7 +942,17 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         startup: vec![0],
     };
     let boot = BootRecord { when: now - 190 * day, total_ms: 88_500, main_ms: 56_600, post_ms: 31_900, degraded: true };
-    let sys = SysCheck { fast_startup: Some(true), hibernate: Some(true), sys_drive: "C:".into(), sys_free: 1, sys_total: 4, sys_ssd: Some(true), os: "Windows 10".into() };
+    let sys = SysCheck {
+        fast_startup: Some(true),
+        hibernate: Some(true),
+        sys_drive: "C:".into(),
+        sys_free: 1,
+        sys_total: 4,
+        sys_ssd: Some(true),
+        os: "Windows 10".into(),
+        firmware: vec![crate::boot::FwBoot { when: now - 190 * day, firmware_ms: 10_987, loader_ms: 2_108, boot_type: Some(1) }],
+        board: crate::boot::Board { maker: "ASUS".into(), product: "Z590".into(), bios_version: "0820".into(), bios_date: "04/27/2021".into(), uefi: Some(true), secure_boot: Some(false) },
+    };
     let data = BootData { log: BootLog::Ok { boots: vec![boot], slow: vec![si.clone()], note: None }, items: vec![it], sys, changes: Vec::new(), tasks: crate::bootopt::TaskList::NeedAdmin, services: Ok(Vec::new()) };
     let report = full_report(&data);
     let one = slow_prompt(&si, &data.items, "Windows 10");
