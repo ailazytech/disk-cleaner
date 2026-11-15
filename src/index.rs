@@ -216,3 +216,28 @@ fn run_mft(target: &Path, prog: &Progress) -> Result<(Tree, Origin, Saver), Stri
     }
     Ok((tree, Origin::FullMft, saver))
 }
+
+/// 只讀快取（不重新掃描）：先找目錄列舉的快取，再找 MFT 快取。回傳（樹、快取年齡秒數）。
+pub fn load_cached_drive(letter: char) -> Option<(Tree, u64)> {
+    let letter = letter.to_ascii_uppercase();
+    let root = PathBuf::from(format!("{letter}:\\"));
+    if let Ok((meta, raw)) = cache::load(&cache::key_path(&root))
+        && meta.method == METHOD_WALK
+    {
+        let age = cache::now_unix().saturating_sub(meta.created);
+        return Some((finalize(&raw, 0, meta.errors, "目錄列舉（快取）"), age));
+    }
+    let prefix = format!("vol-{letter}-");
+    let rd = std::fs::read_dir(cache::cache_dir()).ok()?;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(key) = name.strip_prefix(&prefix).and(name.strip_suffix(".idx"))
+            && let Ok((meta, raw)) = cache::load(key)
+            && meta.method == METHOD_MFT
+        {
+            let age = cache::now_unix().saturating_sub(meta.created);
+            return Some((finalize(&raw, meta.root_index, 0, "MFT（快取）"), age));
+        }
+    }
+    None
+}

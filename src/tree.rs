@@ -82,20 +82,20 @@ impl Kind {
 
     pub fn color(self) -> [u8; 3] {
         match self {
-            Kind::Dir => [90, 96, 110],
-            Kind::Video => [232, 104, 74],
-            Kind::Image => [246, 189, 22],
-            Kind::Audio => [146, 112, 202],
-            Kind::Archive => [255, 157, 77],
-            Kind::DiskImage => [217, 79, 112],
-            Kind::Document => [90, 216, 166],
-            Kind::Code => [91, 143, 249],
-            Kind::Binary => [109, 200, 236],
-            Kind::Data => [38, 154, 153],
-            Kind::Game => [160, 217, 17],
-            Kind::Temp => [201, 162, 126],
-            Kind::System => [140, 140, 150],
-            Kind::Other => [126, 140, 154],
+            Kind::Dir => [206, 212, 230],
+            Kind::Video => [240, 118, 140],
+            Kind::Image => [240, 188, 86],
+            Kind::Audio => [156, 122, 232],
+            Kind::Archive => [250, 158, 98],
+            Kind::DiskImage => [222, 92, 132],
+            Kind::Document => [76, 190, 150],
+            Kind::Code => [84, 136, 250],
+            Kind::Binary => [112, 176, 252],
+            Kind::Data => [64, 182, 186],
+            Kind::Game => [132, 196, 92],
+            Kind::Temp => [206, 172, 132],
+            Kind::System => [150, 160, 186],
+            Kind::Other => [118, 118, 236],
         }
     }
 }

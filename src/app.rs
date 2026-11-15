@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use parking_lot::Mutex;
 
 use crate::cleaner::{self, DelProgress, Found, Measured};
@@ -18,12 +18,49 @@ use crate::settings::Settings;
 use crate::tree::{Kind, Stats, Tree};
 use crate::treemap::Tile;
 use crate::win::{self, DriveInfo};
-use crate::{fmt, ui_analyze, ui_clean};
+use crate::summary::DriveSummary;
+use crate::{fmt, ui_analyze, ui_clean, ui_dash};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
+    Dash,
     Clean,
     Analyze,
+}
+
+// ---------------------------------------------------------------------------
+// 儀表板狀態
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DashMode {
+    /// 空間組成：各檔案類型＋可用空間
+    Composition,
+    /// 可清理：各清理類別＋其他已用＋可用
+    Cleanable,
+}
+
+pub struct DashJob {
+    pub prog: Arc<Progress>,
+    pub rx: crossbeam_channel::Receiver<DriveSummary>,
+    pub done: Arc<AtomicBool>,
+    pub current: Arc<Mutex<String>>,
+    /// 只讀快取（啟動時回填），不做完整掃描
+    pub cache_only: bool,
+}
+
+pub struct DashState {
+    /// None = 全部磁碟
+    pub drive: Option<char>,
+    pub mode: DashMode,
+    /// 圖例中隱藏的項目（key）
+    pub hidden: std::collections::HashSet<String>,
+    pub summaries: std::collections::HashMap<char, DriveSummary>,
+    pub job: Option<DashJob>,
+    pub recycle: std::collections::HashMap<char, u64>,
+    pub recycle_at: Option<Instant>,
+    pub hover: Option<String>,
+    /// 從儀表板點類型進分析頁時，載入後要突顯的類型
+    pub pending_focus: Option<Kind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +210,7 @@ pub struct App {
     pub settings: Settings,
     pub clean: CleanState,
     pub an: AnalyzeState,
+    pub dash: DashState,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,28 +250,10 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn setup_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    ctx.all_styles_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.button_padding = egui::vec2(10.0, 4.0);
-        s.interaction.tooltip_delay = 0.25;
-        for (ts, f) in s.text_styles.iter_mut() {
-            match ts {
-                egui::TextStyle::Body | egui::TextStyle::Button => f.size = 14.5,
-                egui::TextStyle::Small => f.size = 12.0,
-                egui::TextStyle::Heading => f.size = 20.0,
-                egui::TextStyle::Monospace => f.size = 13.5,
-                _ => {}
-            }
-        }
-    });
-}
-
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, analyze: Option<PathBuf>) -> Self {
         setup_fonts(&cc.egui_ctx);
-        setup_style(&cc.egui_ctx);
+        crate::theme::apply(&cc.egui_ctx);
         let settings = Settings::load();
         let rows = rules::catalog()
             .into_iter()
@@ -246,7 +266,7 @@ impl App {
         );
         let mut app = App {
             logo,
-            tab: Tab::Clean,
+            tab: Tab::Dash,
             elevated: win::is_elevated(),
             drives: win::drives(),
             drives_at: Instant::now(),
@@ -287,9 +307,26 @@ impl App {
                 error: None,
                 message: None,
             },
+            dash: DashState {
+                drive: None,
+                mode: DashMode::Composition,
+                hidden: Default::default(),
+                summaries: crate::summary::load_all(),
+                job: None,
+                recycle: Default::default(),
+                recycle_at: None,
+                hover: None,
+                pending_focus: None,
+            },
         };
         app.load_result_caches();
         app.start_measure(&cc.egui_ctx, None);
+        // 還沒有摘要、但有掃描快取的磁碟：背景讀快取回填（不重新掃描）
+        let missing: Vec<char> =
+            app.drives.iter().map(|d| d.letter()).filter(|l| !app.dash.summaries.contains_key(l)).collect();
+        if !missing.is_empty() {
+            app.start_dash_scan(&cc.egui_ctx, missing, true);
+        }
         if let Some(p) = analyze {
             app.start_scan(&cc.egui_ctx, p, true);
         }
@@ -449,7 +486,10 @@ impl App {
         let mut n = 0;
         for r in &self.clean.rows {
             if r.checked {
-                b += r.bytes();
+                // 外部指令（Docker、DISM…）能釋放多少無法事先知道，不計入預計釋放
+                if !r.is_command() {
+                    b += r.bytes();
+                }
                 n += 1;
             }
         }
@@ -480,8 +520,14 @@ impl App {
                 rule_idx.push(i);
             }
         }
-        let arts: Vec<PathBuf> =
-            self.clean.proj.items.iter().filter(|a| a.checked).map(|a| a.art.path.clone()).collect();
+        let arts: Vec<(PathBuf, &'static str)> = self
+            .clean
+            .proj
+            .items
+            .iter()
+            .filter(|a| a.checked)
+            .map(|a| (a.art.path.clone(), a.art.kind.id))
+            .collect();
         let models: Vec<Model> = self.clean.proj.models.iter().filter(|m| m.checked).map(|m| m.m.clone()).collect();
         let (planned, _) = self.selected_bytes();
         prog.steps.store((plan.len() + arts.len() + models.len()) as u64, Relaxed);
@@ -503,7 +549,13 @@ impl App {
                     break;
                 }
                 *prog.current.lock() = rule.name.clone();
-                cleaner::clean_rule(rule, found, &prog);
+                // 刪除前重新測量：畫面上可能是快取的舊結果，不能拿舊路徑直接刪
+                let fresh = if matches!(rule.action, rules::Action::Delete) {
+                    cleaner::measure(rule, &prog.cancel).found
+                } else {
+                    found.clone()
+                };
+                cleaner::clean_rule(rule, &fresh, &prog);
                 prog.step.fetch_add(1, Relaxed);
                 ctx.request_repaint();
             }
@@ -511,13 +563,19 @@ impl App {
                 if prog.cancel.load(Relaxed) {
                     break;
                 }
+                // 刪除前重新確認它現在還是同一種建置產物（快取可能是舊的）
+                if crate::projects::revalidate(&a.0).is_none_or(|k| k.id != a.1) {
+                    prog.log(format!("⚠ {}：已經不是建置產物（或專案標記不見了），已略過", a.0.display()));
+                    prog.step.fetch_add(1, Relaxed);
+                    continue;
+                }
                 let before = prog.freed.load(Relaxed);
-                let ok = cleaner::delete_dir(a, &prog);
+                let ok = cleaner::delete_dir(&a.0, &prog);
                 let freed = prog.freed.load(Relaxed) - before;
                 prog.log(format!(
                     "{} {}：釋放 {}",
                     if ok { "✔" } else { "⚠" },
-                    a.display(),
+                    a.0.display(),
                     fmt::size(freed)
                 ));
                 prog.step.fetch_add(1, Relaxed);
@@ -531,7 +589,7 @@ impl App {
                 let before = prog.freed.load(Relaxed);
                 let ok = match m.del {
                     crate::models::ModelDel::Dir => cleaner::delete_dir(&m.path, &prog),
-                    crate::models::ModelDel::File => cleaner::delete_file(&m.path, &prog),
+                    crate::models::ModelDel::File => cleaner::delete_file(&m.path, u64::MAX, &prog),
                     crate::models::ModelDel::Ollama => match crate::models::delete_ollama(&m.path) {
                         Ok(freed) => {
                             prog.freed.fetch_add(freed, Relaxed);
@@ -569,7 +627,9 @@ impl App {
             }
             self.save_projects();
             self.refresh_drives();
-            self.start_measure(ctx, Some(idx));
+            let _ = idx;
+            // 重新計算全部規則（若清理時有全量計算在跑，只算部分會讓其他規則停在舊數字）
+            self.start_measure(ctx, None);
         }
     }
 
@@ -599,6 +659,14 @@ impl App {
         self.an.job = None;
         match res {
             Ok(out) => {
+                // 掃的是整顆磁碟（或 MFT 整顆索引）就順便更新儀表板的摘要
+                let root_name = out.tree.name(0).to_string();
+                if root_name.len() == 3 && root_name.ends_with(":\\") {
+                    let letter = root_name.chars().next().unwrap_or('?').to_ascii_uppercase();
+                    let s = DriveSummary::from_tree(letter, &out.tree, 0);
+                    self.dash.summaries.insert(letter, s);
+                    crate::summary::save_all(&self.dash.summaries);
+                }
                 let rev = self.an.data.as_ref().map(|d| d.rev + 1).unwrap_or(1);
                 self.an.view = out.view;
                 self.an.history.clear();
@@ -607,9 +675,85 @@ impl App {
                 self.an.stats = None;
                 self.an.kind_focus = None;
                 self.an.data = Some(Loaded { tree: out.tree, origin: out.origin, secs: out.secs, target: out.target, base: out.view, rev });
+                if let Some(k) = self.dash.pending_focus.take() {
+                    self.an.kind_focus = Some(k);
+                    self.an.side = Side::Types;
+                }
             }
             Err(e) => self.an.error = Some(e),
         }
+    }
+
+    // ---------------- 儀表板：磁碟摘要 ----------------
+
+    /// 依序取得各磁碟的空間組成。cache_only=true 只讀快取（啟動回填用），否則沒有快取就完整掃描。
+    pub fn start_dash_scan(&mut self, ctx: &egui::Context, letters: Vec<char>, cache_only: bool) {
+        if self.dash.job.is_some() {
+            return;
+        }
+        let prog = Arc::new(Progress::default());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let done = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(Mutex::new(String::new()));
+        self.dash.job = Some(DashJob { prog: prog.clone(), rx, done: done.clone(), current: current.clone(), cache_only });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for letter in letters {
+                if prog.cancelled() {
+                    break;
+                }
+                *current.lock() = format!("{letter}:");
+                ctx.request_repaint();
+                let summary = if cache_only {
+                    index::load_cached_drive(letter).map(|(tree, _)| DriveSummary::from_tree(letter, &tree, 0))
+                } else {
+                    // 計數歸零，讓進度顯示這顆磁碟的數字
+                    for c in [&prog.files, &prog.dirs, &prog.bytes, &prog.total, &prog.done] {
+                        c.store(0, Relaxed);
+                    }
+                    let root = PathBuf::from(format!("{letter}:\\"));
+                    index::run(&root, &prog, true).ok().map(|out| {
+                        let node = if out.tree.name(0).len() == 3 { 0 } else { out.view };
+                        DriveSummary::from_tree(letter, &out.tree, node)
+                    })
+                };
+                if let Some(s) = summary {
+                    let _ = tx.send(s);
+                }
+                ctx.request_repaint();
+            }
+            done.store(true, Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_dash(&mut self) {
+        let Some(job) = &self.dash.job else { return };
+        let mut changed = false;
+        while let Ok(s) = job.rx.try_recv() {
+            self.dash.summaries.insert(s.letter, s);
+            changed = true;
+        }
+        let finished = job.done.load(Relaxed);
+        if changed {
+            crate::summary::save_all(&self.dash.summaries);
+        }
+        if finished {
+            self.dash.job = None;
+        }
+    }
+
+    /// 各磁碟資源回收筒的大小（30 秒更新一次）
+    pub fn recycle_sizes(&mut self) -> &std::collections::HashMap<char, u64> {
+        if self.dash.recycle_at.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+            self.dash.recycle = self
+                .drives
+                .iter()
+                .map(|d| (d.letter(), win::recycle_bin_size(Some(&d.root)).0))
+                .collect();
+            self.dash.recycle_at = Some(Instant::now());
+        }
+        &self.dash.recycle
     }
 
     fn poll_del(&mut self) {
@@ -619,16 +763,21 @@ impl App {
         }
         let job = self.an.del_job.take().unwrap();
         if let Some(d) = &mut self.an.data {
-            if !job.path.exists() {
+            // 用不跟隨連結的方式確認（壞掉的連結 exists() 也會回傳 false）
+            if std::fs::symlink_metadata(&job.path).is_err() {
                 d.tree.mark_deleted(job.node);
                 d.rev += 1;
                 self.an.message = Some(format!("已刪除 {}", job.path.display()));
             } else {
                 let failed = job.prog.failed.load(Relaxed);
-                self.an.message = Some(format!(
-                    "部分檔案無法刪除（{failed} 個使用中或無權限），已釋放 {}。建議重新掃描。",
-                    fmt::size(job.prog.freed.load(Relaxed))
-                ));
+                let reason = job.prog.log.lock().last().cloned();
+                self.an.message = Some(match reason {
+                    Some(r) => format!("沒有刪除：{r}"),
+                    None => format!(
+                        "部分檔案無法刪除（{failed} 個使用中或無權限），已釋放 {}。建議重新掃描。",
+                        fmt::size(job.prog.freed.load(Relaxed))
+                    ),
+                });
             }
             if self.an.selected == Some(job.node) {
                 self.an.selected = None;
@@ -644,16 +793,24 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             com_init();
-            if req.permanent {
-                if req.path.is_dir() {
+            let meta = win::stat(&req.path);
+            let is_dir = meta.is_some_and(|m| m.0 & win::ATTR_DIRECTORY != 0);
+            // 檔案在掃描之後被換掉（大小不同）就不刪，請使用者重新掃描
+            if !is_dir && meta.is_some_and(|m| m.1 != req.size && m.0 & win::ATTR_REPARSE == 0) {
+                prog.log("檔案在掃描之後有變動，請重新掃描再刪除");
+                prog.failed.fetch_add(1, Relaxed);
+            } else if cleaner::is_protected(&req.path) {
+                prog.log("這是受保護的位置，不能刪除");
+                prog.failed.fetch_add(1, Relaxed);
+            } else if req.permanent {
+                if is_dir {
                     cleaner::delete_dir(&req.path, &prog);
                 } else {
-                    cleaner::delete_file(&req.path, &prog);
+                    cleaner::delete_file(&req.path, u64::MAX, &prog);
                 }
-            } else if cleaner::is_protected(&req.path) {
-                prog.log("受保護的位置");
-            } else {
-                win::move_to_recycle_bin(std::slice::from_ref(&req.path));
+            } else if !win::move_to_recycle_bin(std::slice::from_ref(&req.path)) {
+                prog.log("無法移到資源回收筒（路徑太長、檔案使用中，或取消了操作）");
+                prog.failed.fetch_add(1, Relaxed);
             }
             done.store(true, Relaxed);
             ctx.request_repaint();
@@ -666,6 +823,7 @@ impl App {
             || self.clean.job.as_ref().is_some_and(|j| j.finished.is_none())
             || self.an.job.is_some()
             || self.an.del_job.is_some()
+            || self.dash.job.is_some()
     }
 
     // ---------------- 上方工具列 ----------------
@@ -679,16 +837,17 @@ impl App {
             let tab = |ui: &mut egui::Ui, cur: &mut Tab, t: Tab, label: &str| {
                 let sel = *cur == t;
                 let txt = RichText::new(label).size(15.5);
-                let txt = if sel { txt.strong().color(Color32::WHITE) } else { txt };
+                let txt = if sel { txt.strong().color(crate::theme::BLUE) } else { txt };
                 if ui.selectable_label(sel, txt).clicked() {
                     *cur = t;
                 }
             };
+            tab(ui, &mut self.tab, Tab::Dash, "  儀表板  ");
             tab(ui, &mut self.tab, Tab::Clean, "  清理  ");
             tab(ui, &mut self.tab, Tab::Analyze, "  磁碟分析  ");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.elevated {
-                    ui.label(RichText::new("🛡 系統管理員").color(Color32::from_rgb(120, 200, 120)))
+                    ui.label(RichText::new("🛡 系統管理員").color(crate::theme::GREEN))
                         .on_hover_text("已啟用 MFT 極速掃描與系統項目清理");
                 } else if ui
                     .button("🛡 以系統管理員重新啟動")
@@ -718,6 +877,7 @@ impl eframe::App for App {
         self.poll_clean(&ctx);
         self.poll_scan();
         self.poll_del();
+        self.poll_dash();
         if self.drives_at.elapsed() > Duration::from_secs(20) {
             self.refresh_drives();
         }
@@ -729,11 +889,13 @@ impl eframe::App for App {
             self.start_scan(&ctx, p, true);
         }
 
+        crate::theme::paint_background(&ctx);
         egui::Panel::top("top")
-            .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(8, 8)))
+            .frame(crate::theme::bar())
             .show(ui, |ui| self.top_bar(ui));
 
         match self.tab {
+            Tab::Dash => ui_dash::show(self, ui),
             Tab::Clean => ui_clean::show(self, ui),
             Tab::Analyze => ui_analyze::show(self, ui),
         }
@@ -746,8 +908,5 @@ impl eframe::App for App {
 
 /// 規則預設是否勾選：「安全」、有東西可清、權限足夠、不是外部指令。
 fn default_checked(row: &RuleRow, elevated: bool) -> bool {
-    row.bytes() > 0
-        && row.rule.risk == Risk::Safe
-        && (!row.rule.admin || elevated)
-        && !matches!(row.rule.action, rules::Action::Command { .. })
+    crate::suggest::rule(row, elevated)
 }

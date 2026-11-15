@@ -88,6 +88,49 @@ pub struct Rule {
     pub action: Action,
 }
 
+impl Rule {
+    /// 為什麼可以清（「建議」標籤的說明）。
+    pub fn why(&self) -> String {
+        let specific = match self.id {
+            "npm" | "yarn" | "bun" | "pip" | "poetry" | "composer" | "nuget" => {
+                "只是下載過的套件副本。專案裡已安裝的東西不受影響，下次安裝時會自動重新下載。"
+            }
+            "uv" => "uv 的下載與建置快取。已建立的虛擬環境用的是硬連結，刪掉快取不會壞；下次安裝會重新下載。",
+            "cargo" => "Cargo 下載的 crate 與原始碼副本，不含你安裝的工具。下次建置會自動重新下載。",
+            "go" => "Go 模組與編譯快取，go build 會自動重新下載、重新編譯。",
+            "gradle" => "Gradle 的相依套件與 wrapper 快取，下次建置會自動重新下載。",
+            "deno" | "rustup_tmp" | "sccache" | "electron_dl" | "node_gyp" | "ts" | "vcpkg" | "vs_cmc" | "android_cache"
+            | "unity_cache" | "precommit" => "工具自己的快取或下載暫存，需要時會自動重建，不會影響你的專案。",
+            "user_temp" => "程式留下的暫存檔。只會刪 1 天以前的檔案，正在使用的會自動略過。",
+            "win_temp" => "系統暫存檔。只會刪 1 天以前的檔案，正在使用的會自動略過。",
+            "wer" | "dumps" => "程式當掉時留下的報告與記憶體傾印。除非你要除錯，否則用不到。",
+            "thumbs" => "檔案總管的縮圖資料庫，開啟資料夾時會自動重建。",
+            "shader" => "顯示卡的著色器快取，遊戲或程式下次啟動時會自動重建（第一次會稍慢）。",
+            "inetcache" | "store_temp" => "內建網頁元件與 Store 應用的暫存，需要時會自動重建。",
+            "delivery" => "Windows Update 分享給其他電腦用的快取，刪除不影響已安裝的更新。",
+            "cbs_logs" => "系統元件服務的記錄檔，只用於排查問題。",
+            "wu" => "已安裝完成的更新下載檔，Windows 需要時會重新下載。",
+            "win_upgrade" => "Windows 升級過程留下的暫存，升級完成後就不再需要。",
+            "drivers" => "驅動程式安裝時解壓縮的檔案，驅動已經裝好就用不到了。",
+            "steam" => "Steam 用戶端的網頁快取與記錄，不會動到遊戲。",
+            "adobe_media" => "Premiere／After Effects 的媒體快取，開啟專案時會自動重建。",
+            "electron" => "這些應用程式的網頁快取，不含登入狀態與設定；下次開啟會自動重建。建議先關閉程式。",
+            "vscode" => "編輯器的快取與記錄檔，不會動到設定與擴充套件。",
+            _ => "",
+        };
+        if !specific.is_empty() {
+            return specific.to_string();
+        }
+        match self.cat {
+            Cat::Browser => "只刪網頁快取，不會動到書籤、密碼、Cookie 與登入狀態；瀏覽時會重新快取。".into(),
+            Cat::DevCache => "開發工具的快取，需要時會自動重新下載或重建。".into(),
+            Cat::SysTemp => "系統或程式的暫存，需要時會自動重建。".into(),
+            Cat::Apps => "應用程式的快取，下次開啟會自動重建。".into(),
+            _ => self.desc.clone(),
+        }
+    }
+}
+
 struct B {
     r: Rule,
 }
@@ -151,6 +194,12 @@ impl B {
 }
 
 /// Chromium 系瀏覽器每個設定檔的快取子資料夾
+/// 系統指令的完整路徑（避免以系統管理員身分執行到工作目錄裡的同名程式）
+fn sys32(exe: &str) -> String {
+    let root = env("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    format!("{root}\\System32\\{exe}")
+}
+
 fn chromium(b: B, user_data: &str) -> B {
     let mut b = b;
     for sub in [
@@ -275,7 +324,7 @@ pub fn catalog() -> Vec<Rule> {
         .contents("{LOCALAPPDATA}\\Microsoft\\Windows\\INetCache").done());
     v.push(rule("store_temp", SysTemp, "Microsoft Store 應用程式暫存", "各 UWP 應用的 INetCache、Temp 與 TempState。")
         .contents("{LOCALAPPDATA}\\Packages\\*\\AC\\INetCache").contents("{LOCALAPPDATA}\\Packages\\*\\AC\\Temp")
-        .contents("{LOCALAPPDATA}\\Packages\\*\\TempState").done());
+        .contents("{LOCALAPPDATA}\\Packages\\*\\TempState").age(1).done());
     v.push(rule("delivery", SysTemp, "傳遞最佳化快取", "Windows Update 點對點傳遞的快取。")
         .admin().contents("{WINDIR}\\ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization\\Cache").done());
     v.push(rule("cbs_logs", SysTemp, "Windows 系統記錄檔", "CBS 與 DISM 的記錄檔（有時會長到數 GB）。")
@@ -286,20 +335,20 @@ pub fn catalog() -> Vec<Rule> {
         .admin().contents("{WINDIR}\\SoftwareDistribution\\Download").done());
     v.push(rule("win_old", SysUpdate, "舊版 Windows (Windows.old)", "升級前的舊系統。刪除後就無法退回前一版 Windows。若權限不足無法刪除，請改用系統的「磁碟清理」。")
         .caution().admin().dir("{SYSDRIVE}\\Windows.old").done());
-    v.push(rule("win_upgrade", SysUpdate, "Windows 升級暫存", "$Windows.~BT、$Windows.~WS、ESD 等升級時留下的檔案。")
-        .admin().dir("{SYSDRIVE}\\$Windows.~BT").dir("{SYSDRIVE}\\$Windows.~WS").dir("{SYSDRIVE}\\$WINDOWS.~Q")
+    v.push(rule("win_upgrade", SysUpdate, "Windows 升級暫存", "$Windows.~BT、$Windows.~WS、ESD 等升級時留下的檔案。如果 Windows 剛下載好功能更新、還在等重新開機安裝，請先不要清。")
+        .caution().admin().dir("{SYSDRIVE}\\$Windows.~BT").dir("{SYSDRIVE}\\$Windows.~WS").dir("{SYSDRIVE}\\$WINDOWS.~Q")
         .dir("{SYSDRIVE}\\ESD").dir("{SYSDRIVE}\\$GetCurrent").done());
-    v.push(rule("drivers", SysUpdate, "驅動程式安裝暫存", "NVIDIA／AMD 安裝驅動時解壓縮的檔案（C:\\NVIDIA、C:\\AMD）與下載的安裝檔。")
-        .admin().dir("{SYSDRIVE}\\NVIDIA").dir("{SYSDRIVE}\\AMD")
+    v.push(rule("drivers", SysUpdate, "驅動程式安裝暫存", "NVIDIA／AMD 安裝驅動時解壓縮的檔案（C:\\NVIDIA、C:\\AMD）與下載的安裝檔。請先確認你沒有把其他東西放在這些資料夾裡。")
+        .caution().admin().dir("{SYSDRIVE}\\NVIDIA").dir("{SYSDRIVE}\\AMD")
         .contents("{PROGRAMDATA}\\NVIDIA Corporation\\Downloader").done());
     v.push(rule("patchcache", SysUpdate, "Windows Installer 修補快取", "$PatchCache$。刪除後部分軟體修補或解除安裝時可能會要求原始安裝檔。")
         .caution().admin().contents("{WINDIR}\\Installer\\$PatchCache$").done());
     v.push(rule("pkgcache", SysUpdate, "安裝程式套件快取 (Package Cache)", "Visual Studio、.NET、C++ 執行階段等安裝程式的快取。刪除後修復或解除安裝時可能要求原始安裝檔。")
         .caution().admin().contents("{PROGRAMDATA}\\Package Cache").contents("{PROGRAMDATA}\\Microsoft\\VisualStudio\\Packages").done());
     v.push(rule("winsxs", SysUpdate, "元件存放區清理 (WinSxS)", "執行 DISM /StartComponentCleanup 移除被取代的舊版系統元件，可能需要幾分鐘。")
-        .admin().cmd("Dism.exe", &["/Online", "/Cleanup-Image", "/StartComponentCleanup"]).done());
+        .admin().cmd(&sys32("Dism.exe"), &["/Online", "/Cleanup-Image", "/StartComponentCleanup"]).done());
     v.push(rule("hiberfil", SysUpdate, "休眠檔 (hiberfil.sys)", "執行 powercfg /h off 關閉休眠與快速啟動，休眠檔會被移除。")
-        .caution().admin().info("{SYSDRIVE}\\hiberfil.sys").cmd("powercfg.exe", &["/h", "off"]).done());
+        .caution().admin().info("{SYSDRIVE}\\hiberfil.sys").cmd(&sys32("powercfg.exe"), &["/h", "off"]).done());
     v.push(rule("dl_installers", SysUpdate, "下載資料夾中的安裝檔", "下載資料夾裡 7 天以前的 .exe／.msi／.iso 等安裝檔。請先確認不再需要。")
         .caution().age(7)
         .files("{HOME}\\Downloads", &["*.exe", "*.msi", "*.msix", "*.msixbundle", "*.appx", "*.iso"]).done());
@@ -322,7 +371,17 @@ pub fn catalog() -> Vec<Rule> {
 
     // ---------------- 應用程式 ----------------
     let mut b = rule("electron", Apps, "Electron 應用程式快取", "Discord、VS Code、Slack、Teams、Notion、Obsidian 等以 Electron／WebView 製作的應用快取。建議先關閉這些程式。");
-    for sub in ["Cache", "Code Cache", "GPUCache", "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache", "Service Worker\\CacheStorage"] {
+    // 只用 Chromium／Electron 特有的資料夾結構，避免誤中其他軟體自己叫 Cache 的資料夾
+    for sub in [
+        "Cache\\Cache_Data",
+        "Code Cache\\js",
+        "Code Cache\\wasm",
+        "GPUCache",
+        "DawnCache",
+        "DawnGraphiteCache",
+        "DawnWebGPUCache",
+        "Service Worker\\CacheStorage",
+    ] {
         b = b.contents(&format!("{{APPDATA}}\\*\\{sub}"));
     }
     v.push(b.done());
@@ -353,8 +412,12 @@ pub fn catalog() -> Vec<Rule> {
 // ---------------------------------------------------------------------------
 // 路徑展開
 
+/// 讀環境變數：空字串、相對路徑、網路路徑一律不用；`/` 換成 ``。
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
+    let v = std::env::var(name).ok()?.trim().replace('/', "\\");
+    let b = v.as_bytes();
+    let absolute = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    absolute.then(|| v.trim_end_matches('\\').to_string())
 }
 
 fn token(t: &str) -> Option<Vec<String>> {
@@ -366,7 +429,11 @@ fn token(t: &str) -> Option<Vec<String>> {
         "HOME" => one(home),
         "TEMP" => one(env("TEMP").or_else(|| env("TMP"))),
         "WINDIR" => one(env("SystemRoot").or_else(|| env("WINDIR"))),
-        "SYSDRIVE" => one(env("SystemDrive")),
+        // SystemDrive 的值是 "C:"（沒有反斜線），單獨驗證
+        "SYSDRIVE" => one(std::env::var("SystemDrive").ok().map(|d| d.trim().to_string()).filter(|d| {
+            let b = d.as_bytes();
+            b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+        })),
         "PROGRAMDATA" => one(env("ProgramData")),
         "PF86" => one(env("ProgramFiles(x86)")),
         "PF" => one(env("ProgramFiles")),
@@ -432,6 +499,11 @@ pub fn expand(template: &str) -> Vec<PathBuf> {
 
     let mut out = Vec::new();
     for b in bases {
+        // 只處理本機磁碟的絕對路徑（不碰網路路徑、不接受相對路徑）
+        let bb = b.as_bytes();
+        if bb.len() < 3 || !bb[0].is_ascii_alphabetic() || bb[1] != b':' || bb[2] != b'\\' {
+            continue;
+        }
         let parts: Vec<&str> = b.split('\\').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             continue;
@@ -462,7 +534,8 @@ pub fn expand(template: &str) -> Vec<PathBuf> {
         }
         out.extend(cur.into_iter().filter(|p| p.exists()));
     }
-    out.sort();
-    out.dedup();
+    // 不分大小寫去重複
+    out.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+    out.dedup_by_key(|p| p.to_string_lossy().to_lowercase());
     out
 }

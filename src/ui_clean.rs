@@ -1,36 +1,16 @@
-//! 清理頁。
+//! 清理頁：置中的單欄版面、右側固定的大小欄、整列 hover 底色、「建議」標籤。
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
 
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use eframe::egui::{self, Align, Color32, FontId, Layout, RichText};
 
 use crate::app::App;
 use crate::cleaner::Mode;
 use crate::rules::{Action, Cat, Risk};
-use crate::{fmt, win};
-
-pub const GREEN: Color32 = Color32::from_rgb(110, 200, 120);
-pub const ORANGE: Color32 = Color32::from_rgb(240, 170, 70);
-pub const RED: Color32 = Color32::from_rgb(235, 95, 85);
-pub const DIM: Color32 = Color32::from_rgb(140, 145, 155);
-pub const ACCENT: Color32 = Color32::from_rgb(90, 160, 250);
-
-pub fn usage_bar(ui: &mut egui::Ui, frac: f32, width: f32, height: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 3, Color32::from_gray(55));
-    let col = if frac > 0.9 {
-        RED
-    } else if frac > 0.75 {
-        ORANGE
-    } else {
-        ACCENT
-    };
-    let mut fill = rect;
-    fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
-    p.rect_filled(fill, 3, col);
-}
+pub use crate::theme::{ACCENT, DIM, GREEN, ORANGE, RED};
+use crate::theme::{self, AGE_W, SIZE_W, TEXT};
+use crate::{fmt, suggest, win};
 
 fn risk_badge(ui: &mut egui::Ui, risk: Risk) {
     let (txt, col) = match risk {
@@ -40,13 +20,14 @@ fn risk_badge(ui: &mut egui::Ui, risk: Risk) {
     ui.label(RichText::new(txt).small().color(col));
 }
 
+/// 磁碟卡片（分析頁首頁用）
 pub fn drives_strip(app: &mut App, ui: &mut egui::Ui, clickable: bool) -> Option<PathBuf> {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {
         for d in &app.drives {
             let frac = fmt::pct(d.used(), d.total);
-            let resp = egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 6))
+            let resp = theme::glass()
+                .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
@@ -57,7 +38,7 @@ pub fn drives_strip(app: &mut App, ui: &mut egui::Ui, clickable: bool) -> Option
                                 ui.label(RichText::new(&d.fs).small().color(DIM));
                             }
                         });
-                        usage_bar(ui, frac, 190.0, 8.0);
+                        theme::usage_bar(ui, frac, 190.0, 8.0);
                         ui.label(
                             RichText::new(format!("剩 {} ／ 共 {}", fmt::size(d.free), fmt::size(d.total)))
                                 .small()
@@ -86,15 +67,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let job_running = app.clean.job.as_ref().is_some_and(|j| j.finished.is_none());
 
     // ---------- 底部操作列 ----------
-    egui::Panel::bottom("clean_bottom")
-        .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(12, 10)))
-        .show(ui, |ui| {
+    egui::Panel::bottom("clean_bottom").frame(theme::bar()).show(ui, |ui| {
+        theme::centered(ui, theme::CONTENT_W, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("已勾選 {sel_n} 項")).color(DIM));
-                ui.label(RichText::new(fmt::size(sel_bytes)).strong().size(18.0).color(Color32::WHITE));
+                ui.label(RichText::new(fmt::size(sel_bytes)).strong().size(18.0).color(theme::STRONG));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let btn = egui::Button::new(RichText::new("  🧹 清除已勾選  ").size(16.0).strong())
-                        .fill(Color32::from_rgb(40, 110, 200));
+                    let btn = egui::Button::new(RichText::new("  🧹 清除已勾選  ").size(16.0).strong()).fill(theme::with_alpha(theme::BLUE, 200));
                     if ui.add_enabled(sel_n > 0 && !job_running, btn).clicked() {
                         app.clean.confirm = true;
                     }
@@ -104,28 +83,33 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         app.start_measure(&ctx, None);
                     }
                     let mut show_empty = app.settings.show_empty;
-                    if ui.checkbox(&mut show_empty, "顯示 0 B 的項目").changed() {
+                    // 由右往左排：先放文字，再放勾選框（看起來是「☐ 顯示 0 B 的項目」）
+                    let label_clicked = ui.add(egui::Label::new("顯示 0 B 的項目").sense(egui::Sense::click())).clicked();
+                    if label_clicked {
+                        show_empty = !show_empty;
+                    }
+                    if theme::check(ui, &mut show_empty).changed() | label_clicked {
                         app.settings.show_empty = show_empty;
                         app.settings.save();
                     }
                 });
             });
         });
+    });
 
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            summary(app, ui);
-            ui.add_space(6.0);
-            if let Some(p) = drives_strip(app, ui, true) {
-                app.start_scan(&ctx, p, true);
-            }
-            ui.add_space(8.0);
-            categories(app, ui);
-            ui.add_space(8.0);
-            projects(app, ui);
-            ui.add_space(8.0);
-            models_section(app, ui);
-            ui.add_space(20.0);
+            theme::centered(ui, theme::CONTENT_W, |ui| {
+                ui.add_space(4.0);
+                summary(app, ui);
+                ui.add_space(10.0);
+                categories(app, ui);
+                ui.add_space(6.0);
+                projects(app, ui);
+                ui.add_space(6.0);
+                models_section(app, ui);
+                ui.add_space(20.0);
+            });
         });
     });
 
@@ -137,12 +121,12 @@ fn summary(app: &mut App, ui: &mut egui::Ui) {
     let total: u64 = app.clean.rows.iter().filter(|r| !r.is_command()).map(|r| r.bytes()).sum::<u64>()
         + app.clean.proj.items.iter().map(|a| a.art.bytes).sum::<u64>()
         + app.clean.proj.models.iter().map(|m| m.m.bytes).sum::<u64>();
-    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+    theme::glass().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("可清理空間").color(DIM));
-                ui.label(RichText::new(fmt::size(total)).size(32.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(fmt::size(total)).size(32.0).strong().color(theme::STRONG));
             });
             ui.add_space(24.0);
             ui.vertical(|ui| {
@@ -169,10 +153,50 @@ fn summary(app: &mut App, ui: &mut egui::Ui) {
                             .color(ORANGE),
                     );
                 }
-                ui.label(RichText::new("「安全」項目預設勾選；「注意」項目刪除後需要重新下載或可能影響功能，請自行確認。").small().color(DIM));
+                ui.label(
+                    RichText::new("沒勾選但標著「建議」的項目，滑鼠移到「建議」上可以看為什麼可以清。「注意」項目刪了要重新下載或可能影響功能。")
+                        .small()
+                        .color(DIM),
+                );
             });
         });
     });
+}
+
+/// 類別標題：左邊名稱、右邊總大小（和下面每列的大小對齊）。點名稱也能展開收合。
+/// 每個區塊放在一張霧面白卡片裡。
+fn section_header(ui: &mut egui::Ui, id_salt: &str, title: &str, total: u64, note: Option<String>, add_body: impl FnOnce(&mut egui::Ui)) {
+    theme::glass().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_inner(ui, id_salt, title, total, note, add_body);
+    });
+    ui.add_space(10.0);
+}
+
+fn section_inner(ui: &mut egui::Ui, id_salt: &str, title: &str, total: u64, note: Option<String>, add_body: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.make_persistent_id(("section", id_salt));
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let (_, header, _) = state
+        .show_header(ui, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                theme::right_cell(ui, SIZE_W, &fmt::size(total), FontId::proportional(16.0), theme::STRONG);
+                if let Some(n) = &note {
+                    ui.label(RichText::new(n).small().color(DIM));
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(title).size(16.0).strong().color(TEXT)).sense(egui::Sense::click()))
+                        .clicked()
+                })
+                .inner
+            })
+            .inner
+        })
+        .body(add_body);
+    if header.inner {
+        let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+        st.toggle(ui);
+        st.store(ui.ctx());
+    }
 }
 
 fn categories(app: &mut App, ui: &mut egui::Ui) {
@@ -180,7 +204,6 @@ fn categories(app: &mut App, ui: &mut egui::Ui) {
     let elevated = app.elevated;
     let show_empty = app.settings.show_empty;
 
-    // 依大小排序類別
     let mut cats: Vec<(Cat, u64)> = Cat::ALL
         .iter()
         .map(|&c| (c, app.clean.rows.iter().filter(|r| r.rule.cat == c && !r.is_command()).map(|r| r.bytes()).sum()))
@@ -199,14 +222,14 @@ fn categories(app: &mut App, ui: &mut egui::Ui) {
         }
         idx.sort_by(|&a, &b| app.clean.rows[b].bytes().cmp(&app.clean.rows[a].bytes()));
         let checked: u64 = idx.iter().filter(|&&i| app.clean.rows[i].checked).map(|&i| app.clean.rows[i].bytes()).sum();
-
-        let title = RichText::new(format!("{}  {}    {}", cat.icon(), cat.label(), fmt::size(total))).size(16.0).strong();
-        egui::CollapsingHeader::new(title).id_salt(cat.label()).default_open(true).show(ui, |ui| {
+        let note = (checked > 0).then(|| format!("已勾選 {}", fmt::size(checked)));
+        let title = format!("{}  {}", cat.icon(), cat.label());
+        section_header(ui, cat.label(), &title, total, note, |ui| {
             ui.horizontal(|ui| {
-                if ui.small_button("全選安全項目").clicked() {
+                if ui.small_button("勾選建議項目").clicked() {
                     for &i in &idx {
                         let r = &mut app.clean.rows[i];
-                        r.checked = r.rule.risk == Risk::Safe && r.bytes() > 0 && (!r.rule.admin || elevated) && !r.is_command();
+                        r.checked = suggest::rule(r, elevated);
                     }
                 }
                 if ui.small_button("全不選").clicked() {
@@ -214,39 +237,65 @@ fn categories(app: &mut App, ui: &mut egui::Ui) {
                         app.clean.rows[i].checked = false;
                     }
                 }
-                if checked > 0 {
-                    ui.label(RichText::new(format!("已勾選 {}", fmt::size(checked))).small().color(DIM));
-                }
             });
             for &i in &idx {
                 rule_row(app, ui, i, measuring);
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
     }
 }
 
 fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
     let elevated = app.elevated;
+    let suggested = suggest::rule(&app.clean.rows[i], elevated);
     let row = &mut app.clean.rows[i];
     let locked = row.rule.admin && !elevated;
     let bytes = row.bytes();
     let is_cmd = row.is_command();
     let can = !locked && (bytes > 0 || is_cmd) && row.measured.is_some();
+    let why = row.rule.why();
 
-    let resp = ui
-        .horizontal(|ui| {
-            ui.add_enabled_ui(can, |ui| {
-                ui.checkbox(&mut row.checked, "");
-            });
-            let name = RichText::new(&row.rule.name);
-            let name = if can { name } else { name.color(DIM) };
-            let arrow = if row.expanded { "▾" } else { "▸" };
-            if ui.add(egui::Label::new(RichText::new(arrow).color(DIM)).sense(egui::Sense::click())).clicked()
-                | ui.add(egui::Label::new(name).sense(egui::Sense::click())).clicked()
-            {
-                row.expanded = !row.expanded;
+    // 右欄要顯示的東西先算好（左右兩個閉包不能同時借用 row）
+    enum SizeCell {
+        Spin,
+        Text(String, Color32),
+    }
+    let (cell, errors) = match &row.measured {
+        None if measuring => (SizeCell::Spin, 0),
+        None => (SizeCell::Text("—".into(), DIM), 0),
+        Some(m) if is_cmd && m.found.is_empty() => (SizeCell::Text("—".into(), DIM), m.errors),
+        Some(m) if is_cmd => (SizeCell::Text(format!("約 {}", fmt::size(m.bytes)), DIM), m.errors),
+        Some(m) => (SizeCell::Text(fmt::size(m.bytes), if m.bytes >= 1 << 30 { theme::STRONG } else { TEXT }), m.errors),
+    };
+
+    let (_, _, toggled) = theme::list_row(
+        ui,
+        26.0,
+        |ui| {
+            match &cell {
+                SizeCell::Spin => {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(SIZE_W, 18.0), egui::Sense::hover());
+                    ui.put(egui::Rect::from_center_size(egui::pos2(r.right() - 9.0, r.center().y), egui::vec2(16.0, 16.0)), egui::Spinner::new());
+                }
+                SizeCell::Text(t, c) => {
+                    theme::right_cell(ui, SIZE_W, t, FontId::monospace(13.5), *c);
+                }
             }
+            if errors > 0 {
+                ui.label(RichText::new("⚠").color(ORANGE))
+                    .on_hover_text(format!("{errors} 個資料夾無法讀取（權限不足或使用中），實際大小可能更大"));
+            }
+        },
+        |ui| {
+            ui.add_enabled_ui(can, |ui| {
+                theme::check(ui, &mut row.checked);
+            });
+            theme::suggest_slot(ui, suggested && !row.checked, &why);
+            let arrow = if row.expanded { "▾" } else { "▸" };
+            let name = RichText::new(&row.rule.name).color(if can { TEXT } else { DIM });
+            let a = ui.add(egui::Label::new(RichText::new(arrow).color(DIM)).sense(egui::Sense::click()));
+            let n = ui.add(egui::Label::new(name).sense(egui::Sense::click())).on_hover_text(&row.rule.desc);
             risk_badge(ui, row.rule.risk);
             if locked {
                 ui.label(RichText::new("🔒 需系統管理員").small().color(ORANGE));
@@ -255,36 +304,14 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
                 ui.label(RichText::new("⚙ 執行指令").small().color(ACCENT));
             }
             if row.rule.min_age_days > 0 {
-                ui.label(RichText::new(format!("{} 天前", row.rule.min_age_days)).small().color(DIM));
+                ui.label(RichText::new(format!("{} 天前的檔案", row.rule.min_age_days)).small().color(DIM));
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                match &row.measured {
-                    None if measuring => {
-                        ui.spinner();
-                    }
-                    None => {
-                        ui.label(RichText::new("—").color(DIM));
-                    }
-                    Some(m) => {
-                        let txt = if is_cmd && m.found.is_empty() {
-                            RichText::new("—").color(DIM)
-                        } else if is_cmd {
-                            RichText::new(format!("約 {}", fmt::size(m.bytes))).color(DIM)
-                        } else {
-                            let t = RichText::new(fmt::size(m.bytes)).monospace();
-                            if m.bytes >= 1 << 30 { t.strong().color(Color32::WHITE) } else { t }
-                        };
-                        ui.label(txt);
-                        if m.errors > 0 {
-                            ui.label(RichText::new("⚠").color(ORANGE))
-                                .on_hover_text(format!("{} 個資料夾無法讀取（權限不足或使用中），實際大小可能更大", m.errors));
-                        }
-                    }
-                }
-            });
-        })
-        .response;
-    resp.on_hover_text(&row.rule.desc);
+            a.clicked() || n.clicked()
+        },
+    );
+    if toggled {
+        row.expanded = !row.expanded;
+    }
 
     if row.expanded {
         ui.indent(("rule_detail", i), |ui| {
@@ -299,30 +326,36 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
                 let mut found: Vec<_> = m.found.iter().collect();
                 found.sort_by(|a, b| b.bytes.cmp(&a.bytes));
                 for f in found.iter().take(40) {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{:>10}", fmt::size(f.bytes))).monospace().small());
-                        let kind = match f.mode {
-                            Mode::Contents => "內容",
-                            Mode::Dir => "資料夾",
-                            Mode::File => "檔案",
-                            Mode::Info => "資訊",
-                        };
-                        ui.label(RichText::new(kind).small().color(DIM));
-                        if ui.small_button("📂").on_hover_text("在檔案總管中開啟").clicked() {
-                            if f.mode == Mode::File || f.path.is_file() {
-                                win::reveal_in_explorer(&f.path);
-                            } else {
-                                win::open_in_explorer(&f.path);
+                    theme::list_row(
+                        ui,
+                        20.0,
+                        |ui| {
+                            theme::right_cell(ui, SIZE_W, &fmt::size(f.bytes), FontId::monospace(12.5), TEXT);
+                            if f.files > 1 {
+                                theme::right_cell(ui, AGE_W + 16.0, &format!("{} 個檔案", fmt::count(f.files)), FontId::proportional(11.5), DIM);
                             }
-                        }
-                        ui.label(RichText::new(f.path.to_string_lossy()).small());
-                        if f.files > 1 {
-                            ui.label(RichText::new(format!("{} 個檔案", fmt::count(f.files))).small().color(DIM));
-                        }
-                        if f.errors > 0 {
-                            ui.label(RichText::new(format!("⚠ {} 個無法讀取", f.errors)).small().color(ORANGE));
-                        }
-                    });
+                        },
+                        |ui| {
+                            let kind = match f.mode {
+                                Mode::Contents => "內容",
+                                Mode::Dir => "資料夾",
+                                Mode::File => "檔案",
+                                Mode::Info => "資訊",
+                            };
+                            if ui.small_button("📂").on_hover_text("在檔案總管中開啟").clicked() {
+                                if f.mode == Mode::File || f.path.is_file() {
+                                    win::reveal_in_explorer(&f.path);
+                                } else {
+                                    win::open_in_explorer(&f.path);
+                                }
+                            }
+                            ui.label(RichText::new(kind).small().color(DIM));
+                            ui.add(egui::Label::new(RichText::new(f.path.to_string_lossy()).small().color(TEXT)).truncate());
+                            if f.errors > 0 {
+                                ui.label(RichText::new(format!("⚠ {} 個無法讀取", f.errors)).small().color(ORANGE));
+                            }
+                        },
+                    );
                 }
                 if found.len() > 40 {
                     ui.label(RichText::new(format!("…還有 {} 個位置", found.len() - 40)).small().color(DIM));
@@ -335,24 +368,25 @@ fn rule_row(app: &mut App, ui: &mut egui::Ui, i: usize, measuring: bool) {
 fn projects(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let total: u64 = app.clean.proj.items.iter().map(|a| a.art.bytes).sum();
-    let title = RichText::new(format!(
-        "📁  專案建置產物    {}{}",
-        fmt::size(total),
-        if app.clean.proj.items.is_empty() { String::new() } else { format!("（{} 個）", app.clean.proj.items.len()) }
-    ))
-    .size(16.0)
-    .strong();
-    egui::CollapsingHeader::new(title).id_salt("projects").default_open(true).show(ui, |ui| {
+    let n_items = app.clean.proj.items.len();
+    let checked: u64 = app.clean.proj.items.iter().filter(|a| a.checked).map(|a| a.art.bytes).sum();
+    let note = if n_items == 0 {
+        None
+    } else if checked > 0 {
+        Some(format!("{n_items} 個 · 已勾選 {}", fmt::size(checked)))
+    } else {
+        Some(format!("{n_items} 個"))
+    };
+    section_header(ui, "projects", "📁  專案建置產物", total, note, |ui| {
         ui.label(
             RichText::new("在下列位置搜尋 node_modules、Rust target、Python .venv、Gradle／Flutter／.NET 建置輸出等。只有偵測到專案標記檔（package.json、Cargo.toml…）才會列出。")
                 .small()
                 .color(DIM),
         );
-        // 搜尋位置
         let mut remove = None;
         ui.horizontal_wrapped(|ui| {
             for (i, r) in app.settings.roots.iter().enumerate() {
-                egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                theme::pill().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(r.to_string_lossy()).small());
                         if ui.small_button("✕").on_hover_text("移除").clicked() {
@@ -368,7 +402,7 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
         }
         let finding = app.clean.proj.find.is_some();
         ui.horizontal(|ui| {
-            let te = ui.add(egui::TextEdit::singleline(&mut app.clean.proj.new_root).hint_text("新增搜尋位置，例如 D:\\code").desired_width(260.0));
+            let te = ui.add(egui::TextEdit::singleline(&mut app.clean.proj.new_root).hint_text("新增搜尋位置，例如 D:\\code").desired_width(240.0));
             let add = ui.button("新增").clicked() || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if add && !app.clean.proj.new_root.trim().is_empty() {
                 let p = PathBuf::from(app.clean.proj.new_root.trim());
@@ -389,19 +423,23 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
                 app.settings.roots = crate::projects::default_roots();
                 app.settings.save();
             }
-            ui.add_space(12.0);
-            if finding {
-                if ui.button("⏹ 停止").clicked()
-                    && let Some(f) = &app.clean.proj.find
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if finding {
+                    if ui.button("⏹ 停止").clicked()
+                        && let Some(f) = &app.clean.proj.find
+                    {
+                        f.cancel.store(true, Relaxed);
+                    }
+                } else if ui
+                    .add_enabled(
+                        !app.settings.roots.is_empty(),
+                        egui::Button::new(RichText::new("🔍 搜尋專案產物與 AI 模型").strong()).fill(theme::with_alpha(theme::BLUE, 150)),
+                    )
+                    .clicked()
                 {
-                    f.cancel.store(true, Relaxed);
+                    app.start_find(&ctx);
                 }
-            } else if ui
-                .add_enabled(!app.settings.roots.is_empty(), egui::Button::new(RichText::new("🔍 搜尋專案產物與 AI 模型").strong()))
-                .clicked()
-            {
-                app.start_find(&ctx);
-            }
+            });
         });
         if let Some(f) = &app.clean.proj.find {
             ui.horizontal(|ui| {
@@ -413,19 +451,15 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
                     app.clean.proj.models.len()
                 ));
             });
-            ui.label(RichText::new(f.current.lock().clone()).small().color(DIM));
+            ui.add(egui::Label::new(RichText::new(f.current.lock().clone()).small().color(DIM)).truncate());
         } else if let Some(s) = app.clean.proj.secs {
             ui.label(RichText::new(format!("✔ 搜尋完成（{s:.1} 秒），找到 {} 個", app.clean.proj.items.len())).color(GREEN));
         } else if let Some(age) = app.clean.proj.cached_age {
             ui.label(
-                RichText::new(format!(
-                    "顯示上次搜尋結果（{} 前，已排除不存在的），按「搜尋專案產物」更新。",
-                    crate::index::fmt_age(age)
-                ))
-                .color(DIM),
+                RichText::new(format!("顯示上次搜尋結果（{} 前，已排除不存在的），按「搜尋」更新。", crate::index::fmt_age(age))).color(DIM),
             );
         } else if !app.clean.proj.searched {
-            ui.label(RichText::new("按「搜尋專案產物」開始。").color(DIM));
+            ui.label(RichText::new("按「搜尋專案產物與 AI 模型」開始。").color(DIM));
         }
 
         if app.clean.proj.items.is_empty() {
@@ -457,6 +491,11 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         ui.horizontal(|ui| {
+            if ui.small_button("勾選建議項目").clicked() {
+                for a in &mut app.clean.proj.items {
+                    a.checked = suggest::artifact(&a.art);
+                }
+            }
             if ui.small_button("全選").clicked() {
                 for a in &mut app.clean.proj.items {
                     a.checked = true;
@@ -473,35 +512,146 @@ fn projects(app: &mut App, ui: &mut egui::Ui) {
                     a.checked = a.art.newest < cut;
                 }
             }
-            ui.label(RichText::new("預設勾選：「安全」且 7 天內沒有更動的").small().color(DIM));
         });
         ui.add_space(4.0);
-        let row_h = 22.0;
+        let row_h = 26.0;
         let n = app.clean.proj.items.len();
-        egui::ScrollArea::vertical().id_salt("arts").max_height(420.0).auto_shrink([false, true]).show_rows(
-            ui,
-            row_h,
-            n,
-            |ui, range| {
-                for i in range {
-                    let a = &mut app.clean.proj.items[i];
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_h);
-                        ui.checkbox(&mut a.checked, "");
-                        ui.label(RichText::new(format!("{:>10}", fmt::size(a.art.bytes))).monospace());
-                        let col = if a.art.kind.risk == Risk::Safe { GREEN } else { ORANGE };
-                        ui.label(RichText::new(a.art.kind.label).small().color(col));
-                        ui.label(RichText::new(fmt::ago(a.art.newest)).small().color(DIM))
-                            .on_hover_text("裡面最新檔案的修改時間");
+        egui::ScrollArea::vertical().id_salt("arts").max_height(440.0).auto_shrink([false, true]).show_rows(ui, row_h, n, |ui, range| {
+            for i in range {
+                let a = &mut app.clean.proj.items[i];
+                let sugg = suggest::artifact(&a.art);
+                let why = suggest::artifact_why(&a.art);
+                let (size, age, files) = (a.art.bytes, fmt::ago(a.art.newest), a.art.files);
+                theme::list_row(
+                    ui,
+                    row_h - 6.0,
+                    |ui| {
+                        theme::size_cell(ui, size, size >= 1 << 30);
+                        theme::right_cell(ui, AGE_W, &age, FontId::proportional(12.0), DIM).on_hover_text("裡面最新檔案的修改時間");
+                    },
+                    |ui| {
+                        theme::check(ui, &mut a.checked);
+                        theme::suggest_slot(ui, sugg && !a.checked, &why);
                         if ui.small_button("📂").on_hover_text("在檔案總管中顯示").clicked() {
                             win::reveal_in_explorer(&a.art.path);
                         }
-                        ui.label(a.art.path.to_string_lossy())
-                            .on_hover_text(format!("{} 個檔案", fmt::count(a.art.files)));
-                    });
-                }
-            },
+                        let col = if a.art.kind.risk == Risk::Safe { GREEN } else { ORANGE };
+                        ui.label(RichText::new(a.art.kind.label).small().color(col)).on_hover_text(a.art.kind.hint);
+                        ui.add(egui::Label::new(RichText::new(a.art.path.to_string_lossy()).color(TEXT)).truncate())
+                            .on_hover_text(format!("{}\n{} 個檔案", a.art.path.display(), fmt::count(files)));
+                    },
+                );
+            }
+        });
+    });
+}
+
+fn source_color(src: &str) -> Color32 {
+    match src {
+        "Ollama" => Color32::from_rgb(214, 224, 244),
+        "ComfyUI" => theme::ORANGE,
+        "LM Studio" => theme::PURPLE,
+        s if s.starts_with("Hugging Face") => theme::YELLOW,
+        "模型檔" => DIM,
+        _ => theme::CYAN,
+    }
+}
+
+fn models_section(app: &mut App, ui: &mut egui::Ui) {
+    let dups = suggest::model_dups(&app.clean.proj.models);
+    let total: u64 = app.clean.proj.models.iter().map(|m| m.m.bytes).sum();
+    let n_models = app.clean.proj.models.len();
+    let checked: u64 = app.clean.proj.models.iter().filter(|m| m.checked).map(|m| m.m.bytes).sum();
+    let note = if n_models == 0 {
+        None
+    } else if checked > 0 {
+        Some(format!("{n_models} 個 · 已勾選 {}", fmt::size(checked)))
+    } else {
+        Some(format!("{n_models} 個"))
+    };
+    let finding = app.clean.proj.find.is_some();
+    section_header(ui, "models", "🧠  AI 模型", total, note, |ui| {
+        ui.label(
+            RichText::new("Hugging Face、Ollama、LM Studio、ComfyUI 等模型庫，以及搜尋位置中 50 MB 以上的 .safetensors／.gguf／.ckpt／.pt／.onnx 檔。模型刪除後要重新下載，預設不勾選；Ollama 模型只會刪掉沒有其他模型共用的檔案。")
+                .small()
+                .color(DIM),
         );
+        let models = &mut app.clean.proj.models;
+        if models.is_empty() {
+            ui.label(RichText::new(if finding { "搜尋中…" } else { "按上面的「搜尋專案產物與 AI 模型」開始。" }).color(DIM));
+            return;
+        }
+        let dup_bytes: u64 = models.iter().zip(&dups).filter(|(_, d)| d.is_some()).map(|(m, _)| m.m.bytes).sum();
+
+        // 來源摘要
+        let mut srcs: Vec<(&'static str, u64, usize, bool)> = Vec::new();
+        for m in models.iter() {
+            if let Some(s) = srcs.iter_mut().find(|s| s.0 == m.m.source) {
+                s.1 += m.m.bytes;
+                s.2 += 1;
+                s.3 &= m.checked;
+            } else {
+                srcs.push((m.m.source, m.m.bytes, 1, m.checked));
+            }
+        }
+        srcs.sort_by(|a, b| b.1.cmp(&a.1));
+        ui.horizontal_wrapped(|ui| {
+            for (src, bytes, n, all) in &srcs {
+                let txt = RichText::new(format!("{src}  {}（{n}）", fmt::size(*bytes))).color(source_color(src));
+                if ui.selectable_label(*all, txt).on_hover_text("點一下全選／取消這個來源").clicked() {
+                    for m in models.iter_mut() {
+                        if m.m.source == *src {
+                            m.checked = !*all;
+                        }
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if dup_bytes > 0 && ui.small_button(format!("勾選重複的（每組保留最新一份，可省 {}）", fmt::size(dup_bytes))).clicked() {
+                for (m, d) in models.iter_mut().zip(&dups) {
+                    m.checked = d.is_some();
+                }
+            }
+            if ui.small_button("全不選").clicked() {
+                for m in models.iter_mut() {
+                    m.checked = false;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        let row_h = 26.0;
+        let n = models.len();
+        let kept_paths: Vec<Option<PathBuf>> = dups.iter().map(|d| d.map(|k| models[k].m.path.clone())).collect();
+        egui::ScrollArea::vertical().id_salt("models_list").max_height(440.0).auto_shrink([false, true]).show_rows(ui, row_h, n, |ui, range| {
+            for i in range {
+                let m = &mut models[i];
+                let why = kept_paths[i].as_ref().map(|p| suggest::model_why(p)).unwrap_or_default();
+                let (size, age) = (m.m.bytes, fmt::ago(m.m.newest));
+                let is_dup = kept_paths[i].is_some();
+                theme::list_row(
+                    ui,
+                    row_h - 6.0,
+                    |ui| {
+                        theme::size_cell(ui, size, size >= 1 << 30);
+                        theme::right_cell(ui, AGE_W, &age, FontId::proportional(12.0), DIM);
+                    },
+                    |ui| {
+                        theme::check(ui, &mut m.checked);
+                        theme::suggest_slot(ui, is_dup && !m.checked, &why);
+                        if ui.small_button("📂").on_hover_text("在檔案總管中顯示").clicked() {
+                            win::reveal_in_explorer(&m.m.path);
+                        }
+                        ui.label(RichText::new(m.m.source).small().color(source_color(m.m.source)));
+                        if is_dup {
+                            ui.label(RichText::new("重複").small().color(ORANGE));
+                        }
+                        ui.label(RichText::new(&m.m.name).strong().color(TEXT));
+                        ui.add(egui::Label::new(RichText::new(m.m.path.to_string_lossy()).small().color(DIM)).truncate());
+                    },
+                );
+            }
+        });
     });
 }
 
@@ -513,7 +663,7 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     let mut go = false;
     let mut close = false;
     let resp = egui::Modal::new(egui::Id::new("confirm_clean")).show(ctx, |ui| {
-        ui.set_width(560.0);
+        ui.set_width(580.0);
         ui.heading("確認清除");
         ui.add_space(6.0);
         ui.label(format!("即將清除 {n} 個項目，預計釋放約 {}。", fmt::size(bytes)));
@@ -522,39 +672,41 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
         egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
             let mut sel: Vec<_> = app.clean.rows.iter().filter(|r| r.checked).collect();
             sel.sort_by(|a, b| b.bytes().cmp(&a.bytes()));
+            let line = |ui: &mut egui::Ui, size: u64, name: &str, tag: Option<(&str, Color32)>| {
+                theme::list_row(
+                    ui,
+                    20.0,
+                    |ui| theme::size_cell(ui, size, false),
+                    |ui| {
+                        ui.label(name);
+                        if let Some((t, c)) = tag {
+                            ui.label(RichText::new(t).small().color(c));
+                        }
+                    },
+                );
+            };
             for r in sel {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{:>10}", fmt::size(r.bytes()))).monospace());
-                    ui.label(&r.rule.name);
-                    if r.rule.risk == Risk::Caution {
-                        ui.label(RichText::new("注意").small().color(ORANGE));
-                    }
-                    if r.is_command() {
-                        ui.label(RichText::new("⚙ 指令").small().color(ACCENT));
-                    }
-                });
+                let tag = if r.is_command() {
+                    Some(("⚙ 指令", ACCENT))
+                } else if r.rule.risk == Risk::Caution {
+                    Some(("注意", ORANGE))
+                } else {
+                    None
+                };
+                line(ui, r.bytes(), &r.rule.name, tag);
             }
             let arts: Vec<_> = app.clean.proj.items.iter().filter(|a| a.checked).collect();
             if !arts.is_empty() {
-                let sum: u64 = arts.iter().map(|a| a.art.bytes).sum();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{:>10}", fmt::size(sum))).monospace());
-                    ui.label(format!("專案建置產物 {} 個", arts.len()));
-                });
+                line(ui, arts.iter().map(|a| a.art.bytes).sum(), &format!("專案建置產物 {} 個", arts.len()), None);
             }
             let ms: Vec<_> = app.clean.proj.models.iter().filter(|m| m.checked).collect();
             if !ms.is_empty() {
-                let sum: u64 = ms.iter().map(|m| m.m.bytes).sum();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{:>10}", fmt::size(sum))).monospace());
-                    ui.label(format!("AI 模型 {} 個", ms.len()));
-                    ui.label(RichText::new("注意").small().color(ORANGE));
-                });
+                line(ui, ms.iter().map(|m| m.m.bytes).sum(), &format!("AI 模型 {} 個", ms.len()), Some(("注意", ORANGE)));
             }
         });
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(RichText::new("  確定清除  ").strong()).fill(Color32::from_rgb(190, 60, 50))).clicked() {
+            if ui.add(egui::Button::new(RichText::new("  確定清除  ").strong()).fill(theme::with_alpha(RED, 220))).clicked() {
                 go = true;
             }
             if ui.button("取消").clicked() {
@@ -594,12 +746,12 @@ fn progress_modal(app: &mut App, ctx: &egui::Context) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("已釋放");
-            ui.label(RichText::new(fmt::size(freed)).size(28.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new(fmt::size(freed)).size(28.0).strong().color(theme::STRONG));
             ui.label(RichText::new(format!("（預計 {}）", fmt::size(job.planned))).color(DIM));
         });
         let steps = p.steps.load(Relaxed).max(1);
         let step = p.step.load(Relaxed);
-        ui.add(egui::ProgressBar::new(step as f32 / steps as f32).text(format!("{step}／{steps}")));
+        ui.add(egui::ProgressBar::new(step as f32 / steps as f32).fill(theme::BLUE).text(format!("{step}／{steps}")));
         ui.label(format!(
             "已刪除 {} 個檔案{}",
             fmt::count(p.files.load(Relaxed)),
@@ -631,141 +783,4 @@ fn progress_modal(app: &mut App, ctx: &egui::Context) {
     if close {
         app.clean.job = None;
     }
-}
-
-fn source_color(src: &str) -> Color32 {
-    match src {
-        "Ollama" => Color32::from_rgb(200, 200, 210),
-        "ComfyUI" => Color32::from_rgb(240, 170, 70),
-        "LM Studio" => Color32::from_rgb(150, 130, 250),
-        s if s.starts_with("Hugging Face") => Color32::from_rgb(255, 210, 60),
-        "模型檔" => DIM,
-        _ => ACCENT,
-    }
-}
-
-fn models_section(app: &mut App, ui: &mut egui::Ui) {
-    use std::collections::HashMap;
-    let models = &mut app.clean.proj.models;
-    let total: u64 = models.iter().map(|m| m.m.bytes).sum();
-    let title = RichText::new(format!(
-        "🧠  AI 模型    {}{}",
-        fmt::size(total),
-        if models.is_empty() { String::new() } else { format!("（{} 個）", models.len()) }
-    ))
-    .size(16.0)
-    .strong();
-    let finding = app.clean.proj.find.is_some();
-    egui::CollapsingHeader::new(title).id_salt("models").default_open(true).show(ui, |ui| {
-        ui.label(
-            RichText::new("Hugging Face、Ollama、LM Studio、ComfyUI 等模型庫，以及搜尋位置中 50 MB 以上的 .safetensors／.gguf／.ckpt／.pt／.onnx 檔。模型刪除後要重新下載，預設不勾選。Ollama 模型只會刪掉沒有其他模型共用的檔案。")
-                .small()
-                .color(DIM),
-        );
-        if models.is_empty() {
-            ui.label(
-                RichText::new(if finding { "搜尋中…" } else { "按上面的「搜尋專案產物與 AI 模型」開始。" }).color(DIM),
-            );
-            return;
-        }
-        // 重複檔案：同名同大小
-        let mut dup: HashMap<(String, u64), usize> = HashMap::new();
-        for m in models.iter().filter(|m| m.m.del == crate::models::ModelDel::File) {
-            *dup.entry((m.m.name.to_lowercase(), m.m.bytes)).or_default() += 1;
-        }
-        let is_dup = |m: &crate::models::Model| {
-            m.del == crate::models::ModelDel::File && dup.get(&(m.name.to_lowercase(), m.bytes)).copied().unwrap_or(0) > 1
-        };
-        let dup_bytes: u64 = {
-            // 每組保留一份後可省下的空間
-            let mut seen: HashMap<(String, u64), bool> = HashMap::new();
-            models
-                .iter()
-                .filter(|m| is_dup(&m.m))
-                .filter(|m| seen.insert((m.m.name.to_lowercase(), m.m.bytes), true).is_some())
-                .map(|m| m.m.bytes)
-                .sum()
-        };
-
-        // 來源摘要
-        let mut srcs: Vec<(&'static str, u64, usize, bool)> = Vec::new();
-        for m in models.iter() {
-            if let Some(s) = srcs.iter_mut().find(|s| s.0 == m.m.source) {
-                s.1 += m.m.bytes;
-                s.2 += 1;
-                s.3 &= m.checked;
-            } else {
-                srcs.push((m.m.source, m.m.bytes, 1, m.checked));
-            }
-        }
-        srcs.sort_by(|a, b| b.1.cmp(&a.1));
-        ui.horizontal_wrapped(|ui| {
-            for (src, bytes, n, all) in &srcs {
-                let txt = RichText::new(format!("{src}  {}（{n}）", fmt::size(*bytes))).color(source_color(src));
-                if ui.selectable_label(*all, txt).on_hover_text("點一下全選／取消這個來源").clicked() {
-                    for m in models.iter_mut() {
-                        if m.m.source == *src {
-                            m.checked = !*all;
-                        }
-                    }
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.small_button("全不選").clicked() {
-                for m in models.iter_mut() {
-                    m.checked = false;
-                }
-            }
-            if dup_bytes > 0
-                && ui
-                    .small_button(format!("只選重複的（每組保留最新一份，可省 {}）", fmt::size(dup_bytes)))
-                    .clicked()
-            {
-                let mut keep: HashMap<(String, u64), (u64, usize)> = HashMap::new();
-                for (i, m) in models.iter().enumerate() {
-                    if is_dup(&m.m) {
-                        let k = (m.m.name.to_lowercase(), m.m.bytes);
-                        let e = keep.entry(k).or_insert((m.m.newest, i));
-                        if m.m.newest > e.0 {
-                            *e = (m.m.newest, i);
-                        }
-                    }
-                }
-                let keep_idx: std::collections::HashSet<usize> = keep.values().map(|v| v.1).collect();
-                for (i, m) in models.iter_mut().enumerate() {
-                    m.checked = is_dup(&m.m) && !keep_idx.contains(&i);
-                }
-            }
-        });
-        ui.add_space(4.0);
-        let row_h = 22.0;
-        let n = models.len();
-        let dups: Vec<bool> = models.iter().map(|m| is_dup(&m.m)).collect();
-        egui::ScrollArea::vertical().id_salt("models_list").max_height(420.0).auto_shrink([false, true]).show_rows(
-            ui,
-            row_h,
-            n,
-            |ui, range| {
-                for i in range {
-                    let m = &mut models[i];
-                    ui.horizontal(|ui| {
-                        ui.set_height(row_h);
-                        ui.checkbox(&mut m.checked, "");
-                        ui.label(RichText::new(format!("{:>10}", fmt::size(m.m.bytes))).monospace());
-                        ui.label(RichText::new(m.m.source).small().color(source_color(m.m.source)));
-                        if dups[i] {
-                            ui.label(RichText::new("重複").small().color(ORANGE)).on_hover_text("其他地方有同名、同大小的檔案");
-                        }
-                        ui.label(RichText::new(fmt::ago(m.m.newest)).small().color(DIM));
-                        if ui.small_button("📂").on_hover_text("在檔案總管中顯示").clicked() {
-                            win::reveal_in_explorer(&m.m.path);
-                        }
-                        ui.label(RichText::new(&m.m.name).strong());
-                        ui.add(egui::Label::new(RichText::new(m.m.path.to_string_lossy()).small().color(DIM)).truncate());
-                    });
-                }
-            },
-        );
-    });
 }

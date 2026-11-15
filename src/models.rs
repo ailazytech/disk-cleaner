@@ -63,13 +63,23 @@ pub fn guess_source(path: &Path) -> &'static str {
     }
 }
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
+/// 環境變數裡的路徑：空字串、相對路徑一律不用（避免變成「目前資料夾」）。
+fn env_dir(name: &str) -> Option<PathBuf> {
+    let v = std::env::var(name).ok()?.trim().replace('/', "\\");
+    let b = v.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\').then(|| PathBuf::from(v))
 }
 
-/// 在模型庫資料夾裡遞迴找模型檔（不跟隨連結）。
+fn home() -> Option<PathBuf> {
+    env_dir("USERPROFILE")
+}
+
+/// 在模型庫資料夾裡遞迴找模型檔（不跟隨連結；起點本身是連結也不進去）。
 fn walk_files(dir: &Path, out: &mut Vec<Model>, cancel: &AtomicBool, depth: u32) {
     if cancel.load(Relaxed) || depth > 12 {
+        return;
+    }
+    if depth == 0 && win::has_reparse_on_path(dir) {
         return;
     }
     let mut subdirs = Vec::new();
@@ -78,7 +88,7 @@ fn walk_files(dir: &Path, out: &mut Vec<Model>, cancel: &AtomicBool, depth: u32)
             if !e.is_reparse() {
                 subdirs.push(dir.join(e.name_os()));
             }
-        } else if e.local_size() >= MIN_MODEL {
+        } else if !e.is_reparse() && !e.is_cloud() && e.local_size() >= MIN_MODEL {
             let name = e.name_os().to_string_lossy().into_owned();
             if is_model_file(&name) {
                 let path = dir.join(&name);
@@ -99,11 +109,11 @@ fn walk_files(dir: &Path, out: &mut Vec<Model>, cancel: &AtomicBool, depth: u32)
 }
 
 fn huggingface(out: &mut Vec<Model>, cancel: &AtomicBool) {
-    let hf_home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".cache").join("huggingface"));
-    let hub = std::env::var_os("HF_HUB_CACHE")
-        .or_else(|| std::env::var_os("HUGGINGFACE_HUB_CACHE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| hf_home.join("hub"));
+    let Some(hf_home) = env_dir("HF_HOME").or_else(|| home().map(|h| h.join(".cache").join("huggingface"))) else { return };
+    let hub = env_dir("HF_HUB_CACHE").or_else(|| env_dir("HUGGINGFACE_HUB_CACHE")).unwrap_or_else(|| hf_home.join("hub"));
+    if win::has_reparse_on_path(&hub) {
+        return;
+    }
     let mut dirs = Vec::new();
     let _ = win::list_dir(&hub, |e| {
         if e.is_dir() && !e.is_reparse() {
@@ -138,49 +148,67 @@ fn huggingface(out: &mut Vec<Model>, cancel: &AtomicBool) {
 // ---------------------------------------------------------------------------
 // Ollama
 
-pub fn ollama_dir() -> PathBuf {
-    std::env::var_os("OLLAMA_MODELS").map(PathBuf::from).unwrap_or_else(|| home().join(".ollama").join("models"))
+pub fn ollama_dir() -> Option<PathBuf> {
+    env_dir("OLLAMA_MODELS").or_else(|| home().map(|h| h.join(".ollama").join("models")))
 }
 
 /// 從 manifest 取出 (digest, size) 清單（不引入 JSON 函式庫，只做簡單掃描）。
+/// size 從 digest 所在的那個 `{ … }` 物件裡找，不管欄位順序。
 fn manifest_layers(text: &str) -> Vec<(String, u64)> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(i) = rest.find("\"digest\"") {
-        rest = &rest[i + 8..];
-        let Some(q1) = rest.find('"') else { break };
-        let after = &rest[q1 + 1..];
-        let Some(q2) = after.find('"') else { break };
-        let digest = after[..q2].to_string();
-        // 同一個物件裡的 size
-        let obj_end = after.find('}').unwrap_or(after.len());
-        let obj = &after[..obj_end];
+    let mut pos = 0usize;
+    while let Some(i) = text[pos..].find("\"digest\"") {
+        let at = pos + i;
+        let after = &text[at + 8..];
+        let Some(q1) = after.find('"') else { break };
+        let val = &after[q1 + 1..];
+        let Some(q2) = val.find('"') else { break };
+        let digest = val[..q2].to_string();
+        let start = text[..at].rfind('{').unwrap_or(0);
+        let end = text[at..].find('}').map(|e| at + e).unwrap_or(text.len());
+        let obj = &text[start..end];
         let mut size = 0u64;
         if let Some(si) = obj.find("\"size\"") {
             let num: String = obj[si + 6..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
             size = num.parse().unwrap_or(0);
         }
         out.push((digest, size));
-        rest = after;
+        pos = at + 8;
     }
     out
 }
 
-fn blob_file(models: &Path, digest: &str) -> PathBuf {
-    models.join("blobs").join(digest.replace(':', "-"))
+/// digest 只接受「演算法:十六進位」，例如 sha256:<64 個 hex>；擋掉 `..`、`\` 之類的路徑穿越。
+pub fn valid_digest(d: &str) -> bool {
+    let Some((alg, hex)) = d.split_once(':') else { return false };
+    !alg.is_empty()
+        && alg.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && (32..=128).contains(&hex.len())
+        && hex.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
-/// 所有 manifest：(檔案路徑, 模型名稱)
+fn blob_file(models: &Path, digest: &str) -> Option<PathBuf> {
+    valid_digest(digest).then(|| models.join("blobs").join(digest.replace(':', "-")))
+}
+
+/// 所有 manifest：(檔案路徑, 模型名稱)。不跟隨連結。
 fn ollama_manifests() -> Vec<(PathBuf, String)> {
-    let root = ollama_dir().join("manifests");
+    let Some(models) = ollama_dir() else { return Vec::new() };
+    let root = models.join("manifests");
+    if win::has_reparse_on_path(&root) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     fn rec(dir: &Path, comps: &mut Vec<String>, out: &mut Vec<(PathBuf, String)>) {
         let mut ents = Vec::new();
-        let _ = win::list_dir(dir, |e| ents.push((e.name_os().to_string_lossy().into_owned(), e.is_dir())));
-        for (name, is_dir) in ents {
+        let _ = win::list_dir(dir, |e| ents.push((e.name_os().to_string_lossy().into_owned(), e.is_dir(), e.is_reparse())));
+        for (name, is_dir, reparse) in ents {
+            if reparse {
+                continue;
+            }
             comps.push(name.clone());
             if is_dir {
-                if comps.len() < 6 {
+                if comps.len() < 16 {
                     rec(&dir.join(&name), comps, out);
                 }
             } else if comps.len() >= 3 {
@@ -203,7 +231,7 @@ fn ollama_manifests() -> Vec<(PathBuf, String)> {
 }
 
 fn ollama(out: &mut Vec<Model>) {
-    let models = ollama_dir();
+    let Some(models) = ollama_dir() else { return };
     for (path, name) in ollama_manifests() {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let layers = manifest_layers(&text);
@@ -212,7 +240,7 @@ fn ollama(out: &mut Vec<Model>) {
         for (d, s) in &layers {
             if seen.insert(d.clone()) {
                 // 以實際 blob 大小為準
-                bytes += win::stat(&blob_file(&models, d)).map(|x| x.1).unwrap_or(*s);
+                bytes += blob_file(&models, d).and_then(|b| win::stat(&b)).map(|x| x.1).unwrap_or(*s);
             }
         }
         let newest = win::stat(&path).map(|x| x.2).unwrap_or(0);
@@ -220,19 +248,40 @@ fn ollama(out: &mut Vec<Model>) {
     }
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
 /// 刪除 Ollama 模型：移除 manifest，再刪掉沒有其他 manifest 參照的 blob。回傳釋放的位元組數。
+/// 任何一個其他模型的 manifest 讀不到、manifest 不在 Ollama 目錄裡、digest 格式不對，都直接中止（不刪）。
 pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
-    let models = ollama_dir();
+    let models = ollama_dir().ok_or("找不到 Ollama 模型資料夾")?;
+    let blobs = models.join("blobs");
+    let manifests = models.join("manifests");
+    let inside = manifest
+        .to_string_lossy()
+        .to_lowercase()
+        .starts_with(&format!("{}\\", manifests.to_string_lossy().to_lowercase()));
+    if !inside || win::has_reparse_on_path(manifest) || win::has_reparse_on_path(&blobs) {
+        return Err("manifest 不在 Ollama 模型資料夾裡，或路徑經過連結，已略過".into());
+    }
     let text = std::fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let mine: Vec<String> = manifest_layers(&text).into_iter().map(|x| x.0).collect();
+    if mine.is_empty() || mine.iter().any(|d| !valid_digest(d)) {
+        return Err("manifest 內容格式不對，為了安全不刪".into());
+    }
     let mut others: HashSet<String> = HashSet::new();
+    let mut found_self = false;
     for (p, _) in ollama_manifests() {
-        if p == manifest {
+        if same_path(&p, manifest) {
+            found_self = true;
             continue;
         }
-        if let Ok(t) = std::fs::read_to_string(&p) {
-            others.extend(manifest_layers(&t).into_iter().map(|x| x.0));
-        }
+        let t = std::fs::read_to_string(&p).map_err(|e| format!("讀不到其他模型的 manifest（{}）：{e}，為了安全不刪", p.display()))?;
+        others.extend(manifest_layers(&t).into_iter().map(|x| x.0));
+    }
+    if !found_self {
+        return Err("在 Ollama 模型清單裡找不到這個 manifest，已略過".into());
     }
     std::fs::remove_file(manifest).map_err(|e| e.to_string())?;
     let mut freed = 0;
@@ -240,8 +289,14 @@ pub fn delete_ollama(manifest: &Path) -> Result<u64, String> {
         if others.contains(&d) {
             continue;
         }
-        let b = blob_file(&models, &d);
-        let size = win::stat(&b).map(|x| x.1).unwrap_or(0);
+        let Some(b) = blob_file(&models, &d) else { continue };
+        if !b.parent().is_some_and(|p| same_path(p, &blobs)) {
+            continue;
+        }
+        let Some((attrs, size, _)) = win::stat(&b) else { continue };
+        if attrs & (win::ATTR_DIRECTORY | win::ATTR_REPARSE) != 0 {
+            continue;
+        }
         if std::fs::remove_file(&b).is_ok() {
             freed += size;
         }

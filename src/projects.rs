@@ -15,37 +15,40 @@ pub struct ArtKind {
     pub id: &'static str,
     pub label: &'static str,
     pub risk: Risk,
+    /// 刪掉之後怎麼重建
+    pub hint: &'static str,
 }
 
 macro_rules! kind {
-    ($name:ident, $id:literal, $label:literal, $risk:ident) => {
-        pub static $name: ArtKind = ArtKind { id: $id, label: $label, risk: Risk::$risk };
+    ($name:ident, $id:literal, $label:literal, $risk:ident, $hint:literal) => {
+        pub static $name: ArtKind = ArtKind { id: $id, label: $label, risk: Risk::$risk, hint: $hint };
     };
 }
 
-kind!(NODE, "node", "Node.js 相依套件 (node_modules)", Safe);
-kind!(NODE_NOLOCK, "node_nolock", "node_modules（無 lock 檔）", Caution);
-kind!(RUST, "rust", "Rust 建置輸出 (target)", Safe);
-kind!(VENV, "venv", "Python 虛擬環境", Caution);
-kind!(PYCACHE, "pycache", "Python 位元組碼 (__pycache__)", Safe);
-kind!(PYTOOLS, "pytools", "Python 工具快取 (pytest/mypy/ruff/tox)", Safe);
-kind!(WEB, "web", "前端框架快取 (.next/.nuxt/.turbo…)", Safe);
-kind!(WEB_BUILD, "web_build", "前端建置輸出 (dist/build)", Caution);
-kind!(GRADLE, "gradle", "Gradle／Android 建置輸出", Safe);
-kind!(FLUTTER, "flutter", "Flutter／Dart 建置輸出", Safe);
-kind!(CMAKE, "cmake", "CMake 建置目錄", Safe);
-kind!(DOTNET_OBJ, "dotnet_obj", ".NET 中間檔 (obj)", Safe);
-kind!(DOTNET_BIN, "dotnet_bin", ".NET 建置輸出 (bin)", Caution);
-kind!(UNITY, "unity", "Unity 專案快取 (Library)", Caution);
-kind!(UNREAL, "unreal", "Unreal 中間檔", Safe);
-kind!(ZIG, "zig", "Zig 建置快取", Safe);
-kind!(HASKELL, "haskell", "Haskell 建置輸出", Safe);
-kind!(ELIXIR, "elixir", "Elixir 建置輸出", Safe);
-kind!(ELIXIR_DEPS, "elixir_deps", "Elixir 相依套件 (deps)", Caution);
-kind!(TERRAFORM, "terraform", "Terraform 外掛 (.terraform)", Caution);
-kind!(COMPOSER, "composer", "PHP 相依套件 (vendor)", Caution);
-kind!(GODOT, "godot", "Godot 匯入快取 (.godot)", Safe);
-kind!(CACHEDIR, "cachedir", "快取目錄 (CACHEDIR.TAG)", Safe);
+kind!(NODE, "node", "Node.js 相依套件 (node_modules)", Safe, "需要時執行 npm／pnpm／yarn install 就會照 lock 檔重新安裝。");
+kind!(NODE_NOLOCK, "node_nolock", "node_modules（無 lock 檔）", Caution, "沒有 lock 檔，重新安裝時版本可能不同。");
+kind!(RUST, "rust", "Rust 建置輸出 (target)", Safe, "cargo build 會重新編譯（大型專案要花幾分鐘）。");
+kind!(VENV, "venv", "Python 虛擬環境", Caution, "可以依 requirements.txt／pyproject 重建；手動裝的套件要自己重裝。");
+kind!(PYCACHE, "pycache", "Python 位元組碼 (__pycache__)", Safe, "Python 執行時會自動重新產生。");
+kind!(PYTOOLS, "pytools", "Python 工具快取 (pytest/mypy/ruff/tox)", Safe, "測試與檢查工具下次執行時會重建。");
+kind!(WEB, "web", "前端框架快取 (.next/.nuxt/.turbo…)", Safe, "下次 dev 或 build 會重新產生。");
+kind!(WEB_BUILD, "web_build", "前端建置輸出 (dist/build)", Caution, "重新 build 就會產生；如果裡面有要部署的檔案請先確認。");
+kind!(GRADLE, "gradle", "Gradle／Android 建置輸出", Safe, "下次 Gradle 建置會重新產生。");
+kind!(FLUTTER, "flutter", "Flutter／Dart 建置輸出", Safe, "flutter pub get／build 會重新產生。");
+kind!(CMAKE, "cmake", "CMake 建置目錄", Safe, "重新執行 CMake 設定與建置即可。");
+kind!(CMAKE_OTHER, "cmake_other", "CMake 建置目錄（非常見名稱）", Caution, "重新執行 CMake 設定與建置即可；名稱不常見，請先確認裡面沒有原始碼。");
+kind!(DOTNET_OBJ, "dotnet_obj", ".NET 中間檔 (obj)", Safe, "dotnet build 會重新產生。");
+kind!(DOTNET_BIN, "dotnet_bin", ".NET 建置輸出 (bin)", Caution, "dotnet build 會重新產生；如果有手動放進去的檔案請先確認。");
+kind!(UNITY, "unity", "Unity 專案快取 (Library)", Caution, "Unity 開啟專案時會重新匯入（大型專案要很久）。");
+kind!(UNREAL, "unreal", "Unreal 中間檔", Safe, "Unreal 下次開啟或建置時會重新產生。");
+kind!(ZIG, "zig", "Zig 建置快取", Safe, "zig build 會重新產生。");
+kind!(HASKELL, "haskell", "Haskell 建置輸出", Safe, "stack／cabal build 會重新產生。");
+kind!(ELIXIR, "elixir", "Elixir 建置輸出", Safe, "mix compile 會重新產生。");
+kind!(ELIXIR_DEPS, "elixir_deps", "Elixir 相依套件 (deps)", Caution, "mix deps.get 會重新下載。");
+kind!(TERRAFORM, "terraform", "Terraform 外掛 (.terraform)", Caution, "terraform init 會重新下載外掛。");
+kind!(COMPOSER, "composer", "PHP 相依套件 (vendor)", Caution, "composer install 會重新安裝。");
+kind!(GODOT, "godot", "Godot 匯入快取 (.godot)", Safe, "Godot 開啟專案時會重新匯入。");
+kind!(CACHEDIR, "cachedir", "快取目錄 (CACHEDIR.TAG)", Safe, "這個資料夾自己標示為快取（CACHEDIR.TAG），刪除後會自動重建。");
 
 struct Dir<'a> {
     path: &'a Path,
@@ -63,16 +66,48 @@ impl Dir<'_> {
     fn has_ext(&self, ext: &str) -> bool {
         self.entries.iter().any(|(n, d)| !d && n.rsplit_once('.').is_some_and(|(_, e)| e == ext))
     }
+    /// 子資料夾裡有沒有這個「檔案」（資料夾不算）
     fn child_has(&self, dir: &str, file: &str) -> bool {
-        self.path.join(dir).join(file).exists()
+        self.path.join(dir).join(file).is_file()
+    }
+    fn child_has_any(&self, dir: &str, names: &[&str]) -> bool {
+        names.iter().any(|f| self.path.join(dir).join(f).exists())
     }
     fn gradle(&self) -> bool {
         ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"].iter().any(|f| self.has(f))
     }
 }
 
+/// CACHEDIR.TAG 必須是一般檔案，而且開頭是規範的簽章（https://bford.info/cachedir/）。
+fn valid_cachedir_tag(path: &Path) -> bool {
+    use std::io::Read;
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    if !path.is_file() {
+        return false;
+    }
+    let mut buf = [0u8; 43];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut buf)).is_ok() && buf == SIG
+}
+
+/// __pycache__ 裡應該只有 .pyc 檔
+fn only_pyc(dir: &Path) -> bool {
+    let mut ok = true;
+    let mut any = false;
+    let r = win::list_dir(dir, |e| {
+        any = true;
+        if e.is_dir() || !e.name_os().to_string_lossy().to_lowercase().ends_with(".pyc") {
+            ok = false;
+        }
+    });
+    r.is_ok() && ok && any
+}
+
 /// 判斷 dir.path 底下名為 name（原始大小寫）的子資料夾是不是建置產物。
 fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
+    // 有版本控制的資料夾一定是原始碼，絕對不是建置產物
+    if d.child_has_any(name, &[".git", ".hg", ".svn"]) {
+        return None;
+    }
     let n = name.to_lowercase();
     let pkg = d.has("package.json");
     let k: Option<&'static ArtKind> = match n.as_str() {
@@ -82,9 +117,9 @@ fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
                 .any(|f| d.has(f));
             Some(if lock { &NODE } else { &NODE_NOLOCK })
         }
-        "target" if d.has("cargo.toml") || d.child_has(name, "CACHEDIR.TAG") => Some(&RUST),
+        "target" if d.has("cargo.toml") || valid_cachedir_tag(&d.path.join(name).join("CACHEDIR.TAG")) => Some(&RUST),
         ".venv" | "venv" | "env" | ".env" if d.child_has(name, "pyvenv.cfg") => Some(&VENV),
-        "__pycache__" => Some(&PYCACHE),
+        "__pycache__" if only_pyc(&d.path.join(name)) => Some(&PYCACHE),
         ".pytest_cache" | ".mypy_cache" | ".ruff_cache" | ".hypothesis" | ".tox" | ".nox" => Some(&PYTOOLS),
         ".next" | ".nuxt" | ".svelte-kit" | ".turbo" | ".parcel-cache" | ".angular" | ".docusaurus" | ".expo"
         | ".output" | ".vite" | ".astro" | ".vercel_build_output"
@@ -116,13 +151,35 @@ fn detect(d: &Dir, name: &str) -> Option<&'static ArtKind> {
     if d.child_has(name, "pyvenv.cfg") {
         return Some(&VENV);
     }
-    if n.starts_with("cmake-build-") || d.child_has(name, "CMakeCache.txt") {
+    // 以下是只靠「內容特徵」的判斷：裡面有專案定義檔就是原始碼專案（例如在專案根目錄直接跑過 cmake）
+    if d.child_has_any(name, &["CMakeLists.txt", "Cargo.toml", "package.json", "pyproject.toml", "setup.py", "go.mod", "pom.xml"]) {
+        return None;
+    }
+    // CMake 建置目錄：有 CMakeCache.txt、而且沒有 CMakeLists.txt（上面已排除）。
+    // 常見名稱算「安全」，其他名稱算「注意」。
+    if n.starts_with("cmake-build-") {
         return Some(&CMAKE);
     }
-    if d.child_has(name, "CACHEDIR.TAG") {
+    if d.child_has(name, "CMakeCache.txt") {
+        let usual = n.starts_with("build") || n.starts_with("out") || n == "_build" || n == "bin";
+        return Some(if usual { &CMAKE } else { &CMAKE_OTHER });
+    }
+    if valid_cachedir_tag(&d.path.join(name).join("CACHEDIR.TAG")) {
         return Some(&CACHEDIR);
     }
     None
+}
+
+/// 刪除前重新確認：這個資料夾現在還是同一種建置產物嗎？
+pub fn revalidate(path: &Path) -> Option<&'static ArtKind> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    if win::has_reparse_on_path(path) {
+        return None;
+    }
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    win::list_dir(parent, |e| entries.push((e.name_os().to_string_lossy().to_lowercase(), e.is_dir()))).ok()?;
+    detect(&Dir { path: parent, entries: &entries }, &name)
 }
 
 /// 任何深度都不進去的資料夾
@@ -165,14 +222,18 @@ pub struct FindProgress {
 }
 
 pub fn find(roots: &[PathBuf], prog: &FindProgress) {
-    // 去掉被其他根包含的根
-    let mut rs: Vec<PathBuf> = roots.iter().filter(|p| p.is_dir()).cloned().collect();
-    rs.sort();
-    rs.dedup();
+    // 搜尋位置本身是連結（或路徑經過連結）就不搜，避免跑到連結另一端
+    let mut rs: Vec<PathBuf> = roots.iter().filter(|p| p.is_dir() && !win::has_reparse_on_path(p)).cloned().collect();
+    // 不分大小寫去重複，並去掉被其他根包含的根
+    let key = |p: &PathBuf| p.to_string_lossy().to_lowercase().trim_end_matches('\\').to_string();
+    rs.sort_by_key(key);
+    rs.dedup_by_key(|p| key(p));
+    let keys: Vec<String> = rs.iter().map(key).collect();
     let rs: Vec<PathBuf> = rs
         .iter()
-        .filter(|p| !rs.iter().any(|q| q != *p && p.starts_with(q)))
-        .cloned()
+        .zip(&keys)
+        .filter(|(_, k)| !keys.iter().any(|q| q != *k && k.starts_with(&format!("{q}\\"))))
+        .map(|(p, _)| p.clone())
         .collect();
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -276,7 +337,7 @@ pub fn default_roots() -> Vec<PathBuf> {
 }
 
 /// 所有產物類型（快取讀回時用 id 對應）
-pub static ALL_KINDS: [&ArtKind; 23] = [
-    &NODE, &NODE_NOLOCK, &RUST, &VENV, &PYCACHE, &PYTOOLS, &WEB, &WEB_BUILD, &GRADLE, &FLUTTER, &CMAKE, &DOTNET_OBJ,
+pub static ALL_KINDS: [&ArtKind; 24] = [
+    &NODE, &NODE_NOLOCK, &RUST, &VENV, &PYCACHE, &PYTOOLS, &WEB, &WEB_BUILD, &GRADLE, &FLUTTER, &CMAKE, &CMAKE_OTHER, &DOTNET_OBJ,
     &DOTNET_BIN, &UNITY, &UNREAL, &ZIG, &HASKELL, &ELIXIR, &ELIXIR_DEPS, &TERRAFORM, &COMPOSER, &GODOT, &CACHEDIR,
 ];

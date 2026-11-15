@@ -8,7 +8,11 @@ use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Ric
 use crate::app::{AnalyzeState, App, DelRequest, LayoutCache, Loaded, Side};
 use crate::tree::{Kind, NONE, Stats, Tree, flag};
 use crate::treemap::{self, HEADER_H};
+use crate::theme;
 use crate::ui_clean::{ACCENT, DIM, GREEN, ORANGE, RED, drives_strip};
+
+/// 磁碟分析頁統一的留白
+const PAD: i8 = 16;
 use crate::{fmt, win};
 
 enum Act {
@@ -32,7 +36,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------- 上方：路徑與磁碟 ----------
     egui::Panel::top("an_top")
-        .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 8)))
+        .frame(theme::bar().inner_margin(egui::Margin::symmetric(PAD, 10)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let scanning = app.an.job.is_some();
@@ -80,7 +84,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // ---------- 掃描中 ----------
     if let Some(job) = &app.an.job {
         let mut cancel = false;
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(egui::Margin::same(PAD))).show(ui, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.spinner();
@@ -129,8 +133,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------- 尚未掃描 ----------
     let Some(data) = app.an.data.take() else {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(20.0);
+        egui::CentralPanel::default().frame(egui::Frame::NONE.inner_margin(egui::Margin::same(PAD))).show(ui, |ui| {
+            ui.add_space(4.0);
             if let Some(e) = &app.an.error {
                 ui.label(RichText::new(format!("⚠ {e}")).color(RED));
                 ui.add_space(8.0);
@@ -171,13 +175,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------- 狀態列 ----------
     egui::Panel::top("an_status")
-        .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 4)))
+        .frame(theme::bar().inner_margin(egui::Margin::symmetric(PAD, 8)))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let t = &data.tree;
                 let base = &t.nodes[data.base as usize];
                 ui.label(RichText::new(data.target.to_string_lossy()).strong());
-                ui.label(RichText::new(fmt::size(base.size)).strong().color(Color32::WHITE));
+                ui.label(RichText::new(fmt::size(base.size)).strong().color(crate::theme::STRONG));
                 ui.label(
                     RichText::new(format!(
                         "{} 個檔案 · 索引共 {} 個項目 · {} · {:.2} 秒",
@@ -210,7 +214,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // ---------- 底部：選取項目 ----------
     egui::Panel::bottom("an_bottom")
-        .frame(egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin::symmetric(10, 6)))
+        .frame(theme::bar().inner_margin(egui::Margin::symmetric(PAD, 10)))
         .show(ui, |ui| {
             let t = &data.tree;
             let target = st.selected.or(st.hovered);
@@ -237,7 +241,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         }
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             let icon = if node.is_dir() { "📁" } else { "📄" };
-                            ui.label(RichText::new(fmt::size(node.size)).strong().color(Color32::WHITE));
+                            ui.label(RichText::new(fmt::size(node.size)).strong().color(crate::theme::STRONG));
                             if node.is_dir() {
                                 ui.label(RichText::new(format!("{} 個檔案", fmt::count(node.files as u64))).color(DIM));
                             } else {
@@ -256,9 +260,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // ---------- 左側清單 ----------
     egui::Panel::left("an_left")
         .resizable(true)
-        .default_size(460.0)
-        .min_size(300.0)
+        .default_size(470.0)
+        .min_size(320.0)
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: PAD, right: PAD / 2, top: PAD, bottom: PAD }))
         .show(ui, |ui| {
+            theme::glass().inner_margin(egui::Margin::same(PAD)).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
             breadcrumb(ui, &data.tree, st.view, &mut acts);
             ui.horizontal(|ui| {
                 for (s, label) in [(Side::Folders, "資料夾"), (Side::Types, "類型"), (Side::Exts, "副檔名"), (Side::Largest, "最大檔案")] {
@@ -274,12 +281,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 Side::Exts => ext_list(ui, &data.tree, st),
                 Side::Largest => largest_list(ui, &data.tree, st, &mut acts),
             }
+            });
         });
 
     // ---------- 中央 treemap ----------
-    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-        draw_treemap(ui, &data, st, &mut acts);
-    });
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: PAD / 2, right: PAD, top: PAD, bottom: PAD }))
+        .show(ui, |ui| {
+            theme::glass().inner_margin(egui::Margin::same(PAD / 2)).show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                draw_treemap(ui, &data, st, &mut acts);
+            });
+        });
 
     // 鍵盤／滑鼠側鍵
     let typing = ctx.egui_wants_keyboard_input();
@@ -360,7 +373,12 @@ fn apply(st: &mut AnalyzeState, data: &Loaded, ctx: &egui::Context, a: Act) {
         Act::Reveal(n) => win::reveal_in_explorer(&t.path(n)),
         Act::Copy(n) => ctx.copy_text(t.path(n).to_string_lossy().into_owned()),
         Act::Delete(n, permanent) => {
-            if n != 0 {
+            if st.del_job.is_some() {
+                st.message = Some("上一個刪除還在進行中，請稍候。".into());
+            } else if data.origin.is_stale() {
+                // 快取的舊資料：檔案可能已經換過，不能直接拿來刪
+                st.message = Some("目前顯示的是快取的舊資料，請先按「重新掃描」再刪除。".into());
+            } else if n != 0 {
                 st.del = Some(DelRequest { node: n, path: t.path(n), size: t.nodes[n as usize].size, permanent });
             }
         }
@@ -420,7 +438,7 @@ fn breadcrumb(ui: &mut egui::Ui, t: &Tree, view: u32, acts: &mut Vec<Act>) {
 
 fn bar_row(ui: &mut egui::Ui, frac: f32, color: Color32, width: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), Sense::hover());
-    ui.painter().rect_filled(rect, 2, Color32::from_gray(50));
+    ui.painter().rect_filled(rect, 2, Color32::from_rgb(226, 230, 242));
     let mut f = rect;
     f.set_width((rect.width() * frac).max(1.0));
     ui.painter().rect_filled(f, 2, color);
@@ -451,7 +469,7 @@ fn folder_list(ui: &mut egui::Ui, t: &Tree, st: &mut AnalyzeState, acts: &mut Ve
                         "📄"
                     };
                     let name = RichText::new(format!("{icon} {}", t.name(c)));
-                    let name = if sel { name.strong().color(Color32::WHITE) } else { name };
+                    let name = if sel { name.strong().color(crate::theme::STRONG) } else { name };
                     ui.add(egui::Label::new(name).truncate());
                 })
                 .response
@@ -459,7 +477,7 @@ fn folder_list(ui: &mut egui::Ui, t: &Tree, st: &mut AnalyzeState, acts: &mut Ve
             if sel {
                 ui.painter().rect_stroke(resp.rect, 2, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
             } else if resp.hovered() {
-                ui.painter().rect_filled(resp.rect, 2, Color32::from_white_alpha(8));
+                ui.painter().rect_filled(resp.rect, 2, crate::theme::ROW_HOVER);
             }
             if resp.hovered() {
                 st.hovered = Some(c);
@@ -488,7 +506,7 @@ fn types_list(ui: &mut egui::Ui, t: &Tree, st: &AnalyzeState, acts: &mut Vec<Act
                     let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
                     ui.painter().rect_filled(r, 2, kind_color(k));
                     let label = RichText::new(k.label());
-                    ui.label(if on { label.strong().color(Color32::WHITE) } else { label });
+                    ui.label(if on { label.strong().color(crate::theme::STRONG) } else { label });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(format!("{} 個", fmt::count(count))).small().color(DIM));
                         ui.label(RichText::new(format!("{:>9}", fmt::size(size))).monospace());
@@ -541,7 +559,7 @@ fn largest_list(ui: &mut egui::Ui, t: &Tree, st: &mut AnalyzeState, acts: &mut V
                         ui.painter().rect_filled(r, 2, kind_color(node.kind()));
                         ui.label(RichText::new(format!("{:>9}", fmt::size(node.size))).monospace());
                         let name = RichText::new(t.name(n));
-                        ui.add(egui::Label::new(if sel { name.strong().color(Color32::WHITE) } else { name }).truncate());
+                        ui.add(egui::Label::new(if sel { name.strong().color(crate::theme::STRONG) } else { name }).truncate());
                     });
                     let p = t.path(node.parent);
                     let rel = p.strip_prefix(&base).map(|r| r.to_path_buf()).unwrap_or(p);
@@ -577,7 +595,7 @@ fn draw_treemap(ui: &mut egui::Ui, data: &Loaded, st: &mut AnalyzeState, acts: &
     }
     let tiles = &st.layout.as_ref().unwrap().tiles;
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0, Color32::from_gray(24));
+    painter.rect_filled(rect, 14, Color32::from_rgb(246, 248, 253));
 
     let focus = st.kind_focus;
     let font = FontId::proportional(11.5);
@@ -589,18 +607,20 @@ fn draw_treemap(ui: &mut egui::Ui, data: &Loaded, st: &mut AnalyzeState, acts: &
             if tile.depth == 0 {
                 continue;
             }
-            let g = 38 + (tile.depth.min(8) as u8) * 7;
-            painter.rect_filled(r, 0, Color32::from_gray(g));
-            painter.rect_stroke(r, 0, Stroke::new(1.0, Color32::from_gray(18)), StrokeKind::Inside);
+            // 資料夾：越深越淡的霧面底
+            let d = tile.depth.min(8) as u8;
+            let rad = if r.width() > 30.0 && r.height() > 30.0 { 6 } else { 2 };
+            painter.rect_filled(r, rad, Color32::from_rgb(228 - d * 3, 232 - d * 3, 244 - d * 2));
+            painter.rect_stroke(r, rad, Stroke::new(1.0, Color32::from_rgb(208, 214, 232)), StrokeKind::Inside);
             if tile.header && labels < 1500 {
                 labels += 1;
                 let hr = Rect::from_min_max(r.min, Pos2::new(r.max.x, r.min.y + HEADER_H));
                 painter.with_clip_rect(hr.shrink(1.0)).text(
-                    hr.left_center() + egui::vec2(4.0, 0.0),
+                    hr.left_center() + egui::vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
                     format!("{}  {}", t.name(tile.node), fmt::size(n.size)),
                     font.clone(),
-                    Color32::from_gray(225),
+                    crate::theme::TEXT,
                 );
             }
         } else {
@@ -608,21 +628,27 @@ fn draw_treemap(ui: &mut egui::Ui, data: &Loaded, st: &mut AnalyzeState, acts: &
             if let Some(k) = focus
                 && k != n.kind()
             {
-                c = c.gamma_multiply(0.18);
+                c = crate::theme::tint(c, 0.82);
             }
-            painter.rect_filled(r, 0, c);
-            // 簡單的立體感：左上亮、右下暗
-            if r.width() > 6.0 && r.height() > 6.0 {
-                painter.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, Color32::from_white_alpha(40)));
-                painter.line_segment([r.left_top(), r.left_bottom()], Stroke::new(1.0, Color32::from_white_alpha(40)));
+            // 霧面圓潤色塊：圓角＋左上柔光＋右下陰影
+            let big = r.width() > 8.0 && r.height() > 8.0;
+            let rad = if r.width() > 24.0 && r.height() > 24.0 { 5 } else if big { 2 } else { 0 };
+            let inner = if big { r.shrink(0.8) } else { r };
+            painter.rect_filled(inner, rad, c);
+            if big {
+                let hl = Rect::from_min_max(inner.min, Pos2::new(inner.max.x, inner.min.y + (inner.height() * 0.45).min(14.0)));
+                painter.rect_filled(hl.shrink(1.0), rad, Color32::from_white_alpha(46));
+                painter.line_segment(
+                    [Pos2::new(inner.left() + 2.0, inner.bottom() - 0.5), Pos2::new(inner.right() - 1.0, inner.bottom() - 0.5)],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(20, 30, 70, 46)),
+                );
             }
-            painter.rect_stroke(r, 0, Stroke::new(0.6, Color32::from_black_alpha(140)), StrokeKind::Inside);
             if r.width() > 54.0 && r.height() > 18.0 && labels < 1500 {
                 labels += 1;
                 let cp = painter.with_clip_rect(r.shrink(2.0));
-                cp.text(r.left_top() + egui::vec2(4.0, 3.0), Align2::LEFT_TOP, t.name(tile.node), font.clone(), Color32::from_black_alpha(230));
+                cp.text(r.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, t.name(tile.node), font.clone(), Color32::WHITE);
                 if r.height() > 34.0 {
-                    cp.text(r.left_top() + egui::vec2(4.0, 17.0), Align2::LEFT_TOP, fmt::size(n.size), font.clone(), Color32::from_black_alpha(170));
+                    cp.text(r.left_top() + egui::vec2(6.0, 18.0), Align2::LEFT_TOP, fmt::size(n.size), font.clone(), Color32::from_white_alpha(210));
                 }
             }
         }
@@ -632,7 +658,7 @@ fn draw_treemap(ui: &mut egui::Ui, data: &Loaded, st: &mut AnalyzeState, acts: &
     if let Some(sel) = st.selected
         && let Some(tile) = tiles.iter().find(|x| x.node == sel)
     {
-        painter.rect_stroke(tile.rect, 0, Stroke::new(2.5, Color32::from_rgb(255, 220, 60)), StrokeKind::Inside);
+        painter.rect_stroke(tile.rect, 6, Stroke::new(3.0, crate::theme::STRONG), StrokeKind::Inside);
     }
 
     // 滑鼠
@@ -640,7 +666,7 @@ fn draw_treemap(ui: &mut egui::Ui, data: &Loaded, st: &mut AnalyzeState, acts: &
     if let Some(h) = hover {
         st.hovered = Some(h);
         if let Some(tile) = tiles.iter().rev().find(|x| x.node == h) {
-            painter.rect_stroke(tile.rect, 0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+            painter.rect_stroke(tile.rect, 6, Stroke::new(2.0, crate::theme::BLUE), StrokeKind::Inside);
         }
     } else if resp.hovered() {
         st.hovered = None;

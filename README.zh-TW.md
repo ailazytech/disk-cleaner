@@ -14,11 +14,19 @@
 - 完全不連網，資料不會離開你的電腦
 - 介面目前是繁體中文
 
+![儀表板](docs/images/dashboard.png)
+
 ![磁碟分析](docs/images/analyze.png)
 
 ![清理頁](docs/images/clean.png)
 
 ## 功能
+
+### 儀表板
+
+- 霧面 3D 甜甜圈圖顯示空間都用在哪裡，可切換 **空間組成**（影片、圖片、程式碼、執行檔…加上可用空間）和 **可清理**（開發快取、暫存檔、建置產物、AI 模型…）
+- 可依磁碟篩選；點圖例可以隱藏／顯示某個類型
+- **建議清理** 清單：只列「安全」的快取、7 天以上沒動的建置產物、重複的模型檔；滑鼠移到每一列可以看為什麼可以清
 
 ### 清理
 
@@ -70,11 +78,19 @@
 
 ## 安全設計
 
-- 不跟隨 junction／symlink：只移除連結本身，不會動到連結指向的內容
-- 磁碟根目錄、使用者資料夾、文件／桌面／下載、Windows、Program Files、ProgramData、AppData 根目錄一律拒絕刪除
-- 使用中的檔案會略過；雲端佔位檔（OneDrive）不刪
-- 清理規則是永久刪除（這樣才會真正釋放空間）；分析頁另外提供「移到資源回收筒」
-- `disk-cleaner.exe --selftest` 會在暫存資料夾建立測試環境（junction、唯讀檔、假專案、假的 Ollama 模型庫），逐項驗證上面這些
+清理工具最糟的情況就是刪錯資料，所以刪除的程式一律採「拿不準就不刪」：
+
+- 不跟隨 junction／symlink：目標本身或路徑上任何一層是連結就略過；裡面遇到的連結只移除連結本身
+- 受保護的位置會先正規化路徑（`/`、`..`、結尾斜線、磁碟機相對路徑），**再**解析連結與 8.3 短檔名後各檢查一次：磁碟根目錄、`Users` 底下每一個帳號、文件／桌面／下載、Windows 與系統資料夾（System32、WinSxS…）、Program Files、ProgramData、AppData 根目錄、`$Recycle.Bin`、`System Volume Information`
+- 快取顯示的結果不會直接拿來刪：清理前每條規則都會重新測量，每個建置產物都會重新偵測一次
+- 含 `.git`／`.hg`／`.svn` 的資料夾絕不當成建置產物；`CACHEDIR.TAG` 必須是正確的簽章；在專案根目錄直接跑過 CMake 也不會被誤判
+- Ollama：manifest 的 digest 必須是 `sha256:<十六進位>` 格式，只會刪 `blobs` 資料夾裡的檔案，任何一個其他模型的 manifest 讀不到就整個不刪
+- 使用中的檔案會略過；雲端佔位檔（OneDrive）一律不刪
+- **移到資源回收筒** 遇到無法回收的檔案會先詢問，不會靜默永久刪除；分析頁顯示的是快取舊資料時，要先重新掃描才能刪
+- 清理規則是永久刪除（這樣才會真正釋放空間）
+- `disk-cleaner.exe --selftest` 會在暫存資料夾跑 44 項檢查（junction、唯讀檔、受保護路徑的各種別名、假專案、含惡意 manifest 的假 Ollama 模型庫…）；CI 每次 push 都會跑
+
+刪除相關的程式碼在發佈前經過兩個獨立的 AI 審查（OpenAI Codex 與 Google Gemini），找到的問題都已修正並加進自我測試。
 
 ## 建置
 
@@ -119,7 +135,9 @@ DiskCleaner 不會發出任何網路請求。它保存的東西都在 `%LOCALAPP
 | `src/tree.rs`、`src/treemap.rs` | 扁平掃描樹、統計、squarified 版面 |
 | `src/rules.rs`、`src/cleaner.rs` | 清理規則、大小計算與刪除 |
 | `src/projects.rs`、`src/models.rs` | 建置產物與 AI 模型偵測 |
-| `src/app.rs`、`src/ui_*.rs` | egui 介面 |
+| `src/app.rs`、`src/ui_*.rs` | egui 介面（儀表板、清理、磁碟分析） |
+| `src/theme.rs`、`src/pie3d.rs` | 霧面主題與 3D 甜甜圈圖 |
+| `src/suggest.rs`、`src/summary.rs` | 建議清理的判斷；各磁碟的空間摘要 |
 | `examples/gen_icon.rs` | 產生 `assets/icon.ico`（`cargo run --example gen_icon`） |
 | `tools/` | 截圖／點擊輔助腳本，以及以系統管理員執行的 MFT 效能測試 |
 

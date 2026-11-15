@@ -137,7 +137,12 @@ pub fn list_dir(dir: &Path, mut f: impl FnMut(&Entry)) -> io::Result<()> {
             f(&e);
         }
         if unsafe { FindNextFileW(h, &mut data) } == 0 {
-            break;
+            // 只有 ERROR_NO_MORE_FILES (18) 是正常結束；其他錯誤要回報，不能當成列舉完了
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(18) {
+                break;
+            }
+            return Err(err);
         }
     }
     Ok(())
@@ -156,9 +161,45 @@ pub fn stat(path: &Path) -> Option<(u32, u64, u64)> {
     Some((d.dwFileAttributes, size, mtime))
 }
 
+/// 只清掉唯讀屬性，保留隱藏、系統等其他屬性。
 pub fn clear_readonly(path: &Path) -> bool {
+    let Some((attrs, _, _)) = stat(path) else { return false };
+    let mut new = attrs & !ATTR_READONLY & !ATTR_DIRECTORY;
+    if new == 0 {
+        new = ATTR_NORMAL;
+    }
     let p = long_path(path);
-    unsafe { SetFileAttributesW(p.as_ptr(), ATTR_NORMAL) != 0 }
+    unsafe { SetFileAttributesW(p.as_ptr(), new) != 0 }
+}
+
+/// 路徑本身是不是 reparse point（junction、symlink…）。不會跟隨連結。
+pub fn is_reparse(path: &Path) -> bool {
+    stat(path).is_some_and(|(a, _, _)| a & ATTR_REPARSE != 0)
+}
+
+/// 路徑上（不含磁碟根目錄）有沒有任何一層是 reparse point，包含它自己。
+pub fn has_reparse_on_path(path: &Path) -> bool {
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if p.parent().is_none() {
+            break;
+        }
+        if is_reparse(p) {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// 解析成最終的實際路徑（展開 junction、8.3 短檔名），去掉 `\\?\` 前綴。
+pub fn final_path(path: &Path) -> Option<PathBuf> {
+    let c = std::fs::canonicalize(path).ok()?;
+    let s = c.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return Some(PathBuf::from(format!(r"\\{rest}")));
+    }
+    Some(PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)))
 }
 
 /// 現在時間（FILETIME 單位）。
@@ -252,16 +293,6 @@ pub fn drive_info(root: &str, kind: &'static str) -> Option<DriveInfo> {
     })
 }
 
-/// 指定路徑所在磁碟的剩餘空間。
-pub fn free_space(path: &Path) -> Option<u64> {
-    let w = wide(path);
-    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
-    if unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
-        return None;
-    }
-    Some(free)
-}
-
 // ---------------------------------------------------------------------------
 // 權限
 
@@ -331,10 +362,15 @@ pub fn empty_recycle_bin() -> bool {
 }
 
 /// 移到資源回收筒（可復原）。
+/// 移到資源回收筒。無法回收（太大、回收筒停用）時會跳出警告詢問，不會靜默永久刪除。
+/// SHFileOperation 不支援超過 MAX_PATH 的路徑，這種情況直接回傳 false。
 pub fn move_to_recycle_bin(paths: &[PathBuf]) -> bool {
-    use windows_sys::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
+    use windows_sys::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW};
     if paths.is_empty() {
         return true;
+    }
+    if paths.iter().any(|p| p.as_os_str().len() >= 259) {
+        return false;
     }
     let mut from: Vec<u16> = Vec::new();
     for p in paths {
@@ -345,7 +381,7 @@ pub fn move_to_recycle_bin(paths: &[PathBuf]) -> bool {
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.wFunc = FO_DELETE as u32;
     op.pFrom = from.as_ptr();
-    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16;
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI) as u16;
     let r = unsafe { SHFileOperationW(&mut op) };
     r == 0 && op.fAnyOperationsAborted == 0
 }

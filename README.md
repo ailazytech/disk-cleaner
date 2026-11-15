@@ -14,11 +14,19 @@ A fast disk analyzer and cleaner for Windows, written in Rust with egui. It show
 - No network access at all — nothing leaves your computer
 - The UI is in Traditional Chinese for now (an English UI is not available yet)
 
+![Dashboard](docs/images/dashboard.png)
+
 ![Disk analyzer](docs/images/analyze.png)
 
 ![Clean page](docs/images/clean.png)
 
 ## Features
+
+### Dashboard
+
+- A matte 3D donut chart of where your space goes, switchable between **space composition** (videos, images, code, executables… plus free space) and **cleanable** (dev caches, temp files, build artifacts, AI models…)
+- Filter by drive; click a legend entry to hide or show a type
+- A **suggested cleanup** list: only Safe caches, build artifacts untouched for 7+ days, and duplicate model files — hover a row to see why it is safe to remove
 
 ### Clean
 
@@ -70,11 +78,19 @@ On the author's machine a full walk without administrator rights runs at about 1
 
 ## Safety
 
-- Never follows junctions or symlinks: the link itself is removed, its target is left alone
-- Refuses to delete drive roots, your user folder, Documents / Desktop / Downloads, Windows, Program Files, ProgramData and the AppData roots
-- Files in use are skipped; cloud placeholders (OneDrive) are left alone
-- Clean rules delete permanently (that is how space gets freed); the analyzer also offers **Move to Recycle Bin**
-- `disk-cleaner.exe --selftest` builds a scratch folder (junctions, read-only files, fake projects, a fake Ollama store) and checks all of the above
+Wrongly deleting your data is the worst thing a cleaner can do, so the deletion code is written to fail closed:
+
+- Never follows junctions or symlinks: if a target — or any folder on its path — is a link, it is skipped; links found inside are removed as links only
+- Protected paths are checked after normalizing the path (`/`, `..`, trailing separators, drive-relative paths) **and** after resolving links and 8.3 short names: drive roots, every user profile under `Users`, Documents / Desktop / Downloads, Windows and its system folders (System32, WinSxS…), Program Files, ProgramData, the AppData roots, `$Recycle.Bin`, `System Volume Information`
+- Results shown from the cache are never used to delete: each rule is measured again right before cleaning, and each build artifact is re-detected
+- A folder that contains `.git` / `.hg` / `.svn` is never treated as a build artifact; `CACHEDIR.TAG` must carry the real signature; an in-source CMake build is not mistaken for a build folder
+- Ollama: manifest digests must look like `sha256:<hex>`, blobs are only removed from the `blobs` folder, and nothing is removed if any other manifest can't be read
+- Files in use are skipped; cloud placeholders (OneDrive) are never deleted
+- **Move to Recycle Bin** asks before permanently deleting something that can't be recycled; the analyzer refuses to delete from stale cached data until you rescan
+- Clean rules delete permanently (that is how space gets freed)
+- `disk-cleaner.exe --selftest` runs 44 checks in a scratch folder (junctions, read-only files, protected-path aliases, fake projects, a fake Ollama store with a malicious manifest…); CI runs it on every push
+
+The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release; the issues they found are fixed and covered by the self-test.
 
 ## Build
 
@@ -119,7 +135,9 @@ DiskCleaner makes no network requests. Everything it keeps lives in `%LOCALAPPDA
 | `src/tree.rs`, `src/treemap.rs` | Flat scan tree, statistics, squarified layout |
 | `src/rules.rs`, `src/cleaner.rs` | Clean rules, sizing and deletion |
 | `src/projects.rs`, `src/models.rs` | Build artifact and AI model detection |
-| `src/app.rs`, `src/ui_*.rs` | egui interface |
+| `src/app.rs`, `src/ui_*.rs` | egui interface (dashboard, clean, analyzer) |
+| `src/theme.rs`, `src/pie3d.rs` | Matte theme and the 3D donut chart |
+| `src/suggest.rs`, `src/summary.rs` | Suggested-cleanup logic; per-drive space summaries |
 | `examples/gen_icon.rs` | Generates `assets/icon.ico` (`cargo run --example gen_icon`) |
 | `tools/` | Screenshot / click helpers and the elevated MFT benchmark |
 

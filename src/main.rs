@@ -12,10 +12,15 @@ mod results_cache;
 mod rules;
 mod scan;
 mod settings;
+mod pie3d;
+mod suggest;
+mod summary;
+mod theme;
 mod tree;
 mod treemap;
 mod ui_analyze;
 mod ui_clean;
+mod ui_dash;
 mod win;
 
 use std::sync::atomic::AtomicBool;
@@ -205,11 +210,11 @@ fn selftest() -> bool {
         format!("{{\"schemaVersion\":2,\"layers\":[{}]}}", layers.join(","))
     };
     let lib = om.join("manifests").join("registry.ollama.ai").join("library");
-    w(&lib.join("alpha").join("7b"), &man(&[("sha256:shared", 6), ("sha256:onlya", 5)]));
-    w(&lib.join("beta").join("latest"), &man(&[("sha256:shared", 6), ("sha256:onlyb", 5)]));
-    w(&om.join("blobs").join("sha256-shared"), "shared");
-    w(&om.join("blobs").join("sha256-onlya"), "aaaaa");
-    w(&om.join("blobs").join("sha256-onlyb"), "bbbbb");
+    w(&lib.join("alpha").join("7b"), &man(&[("sha256:1111111111111111111111111111111111111111111111111111111111111111", 6), ("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 5)]));
+    w(&lib.join("beta").join("latest"), &man(&[("sha256:1111111111111111111111111111111111111111111111111111111111111111", 6), ("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 5)]));
+    w(&om.join("blobs").join("sha256-1111111111111111111111111111111111111111111111111111111111111111"), "shared");
+    w(&om.join("blobs").join("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "aaaaa");
+    w(&om.join("blobs").join("sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "bbbbb");
     // SAFETY: 自我測試在單執行緒階段設定環境變數
     unsafe { std::env::set_var("OLLAMA_MODELS", &om) };
     let mut found = Vec::new();
@@ -224,8 +229,8 @@ fn selftest() -> bool {
     check("Ollama 模型大小", found.first().is_some_and(|m| m.bytes == 11));
     let freed = models::delete_ollama(&lib.join("alpha").join("7b"));
     check("刪除 alpha 只釋放獨有的 blob", freed == Ok(5));
-    check("共用 blob 保留", om.join("blobs").join("sha256-shared").exists() && om.join("blobs").join("sha256-onlyb").exists());
-    check("獨有 blob 已刪", !om.join("blobs").join("sha256-onlya").exists() && !lib.join("alpha").join("7b").exists());
+    check("共用 blob 保留", om.join("blobs").join("sha256-1111111111111111111111111111111111111111111111111111111111111111").exists() && om.join("blobs").join("sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").exists());
+    check("獨有 blob 已刪", !om.join("blobs").join("sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").exists() && !lib.join("alpha").join("7b").exists());
     check("模型副檔名判斷", models::is_model_file("x.SafeTensors") && models::is_model_file("a.gguf") && !models::is_model_file("a.bin"));
 
     // 6. 任何名稱的 venv（含 CACHEDIR.TAG）都算虛擬環境
@@ -237,7 +242,70 @@ fn selftest() -> bool {
     projects::find(std::slice::from_ref(&vroot), &prog);
     check("uv venv 判定為虛擬環境（注意）", prog.results.into_inner().iter().any(|a| a.kind.id == "venv"));
 
-    // 7. 萬用字元
+    // 7. 審查發現的問題（Codex／Hydrogen）
+    // 7a. 清理目標本身是 junction：不能清到連結另一端
+    let real = base.join("real_data");
+    w(&real.join("precious.txt"), "precious");
+    let link_target = base.join("cache_link");
+    let _ = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&link_target).arg(&real).output();
+    let dp4 = cleaner::DelProgress::default();
+    cleaner::delete_children(&link_target, u64::MAX, &dp4);
+    check("清理目標是 junction 時不跟隨", real.join("precious.txt").exists());
+    let dp5 = cleaner::DelProgress::default();
+    check("路徑經過 junction 時拒絕刪資料夾", !cleaner::delete_dir(&link_target.join("sub"), &dp5) && real.exists());
+
+    // 7b. is_protected 的路徑別名
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let sysdrive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    check("拒絕 C:\\.", cleaner::is_protected(Path::new(&format!("{sysdrive}\\."))));
+    check("拒絕含 .. 的路徑", cleaner::is_protected(Path::new(&format!("{home}\\..\\SomeoneElse"))));
+    check("拒絕其他使用者的設定檔", cleaner::is_protected(Path::new(&format!("{sysdrive}\\Users\\SomeoneElse"))));
+    check("拒絕 / 寫法的系統資料夾", cleaner::is_protected(Path::new(&format!("{}/System32/drivers", sysroot))));
+    check("拒絕 System32 底下的檔案", cleaner::is_protected(Path::new(&format!("{sysroot}\\System32\\kernel32.dll"))));
+    check("拒絕磁碟機相對路徑", cleaner::is_protected(Path::new("c:foo\\bar")));
+    check("拒絕結尾帶斜線的使用者資料夾", cleaner::is_protected(Path::new(&format!("{home}\\"))));
+    if let Ok(temp) = std::env::var("TEMP") {
+        check("仍允許清 %TEMP% 的內容", !cleaner::is_protected(Path::new(&temp)));
+    }
+
+    // 7c. Ollama 惡意 digest：不能刪到 blobs 以外
+    let outside = om.join("outside.bin");
+    w(&outside, "must stay");
+    let evil = lib.join("evil").join("latest");
+    w(&evil, "{\"layers\":[{\"digest\":\"..\\\\outside.bin\",\"size\":9}]}");
+    check("Ollama 惡意 digest 被拒絕", models::delete_ollama(&evil).is_err() && outside.exists() && evil.exists());
+    check("digest 格式驗證", models::valid_digest(&format!("sha256:{}", "a".repeat(64))) && !models::valid_digest("sha256:../x"));
+
+    // 7d. 偵測誤判
+    let cm = base.join("cmake_cases");
+    // 在專案根目錄直接跑過 cmake（in-source build）：整個專案不能被當成建置目錄
+    w(&cm.join("my-app").join("CMakeCache.txt"), "x");
+    w(&cm.join("my-app").join("CMakeLists.txt"), "x");
+    w(&cm.join("my-app").join("main.cpp"), "int main(){}");
+    // 正常的 build 目錄
+    w(&cm.join("my-lib").join("CMakeLists.txt"), "x");
+    w(&cm.join("my-lib").join("build").join("CMakeCache.txt"), "x");
+    // CACHEDIR.TAG 簽章不對
+    w(&cm.join("fake-cache").join("CACHEDIR.TAG"), "not a real tag");
+    w(&cm.join("real-cache").join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n");
+    // 有 .git 的資料夾就算叫 target 也不算
+    w(&cm.join("rsproj").join("Cargo.toml"), "[package]");
+    w(&cm.join("rsproj").join("target").join(".git").join("HEAD"), "ref");
+    // __pycache__ 裡有不是 .pyc 的檔案
+    w(&cm.join("py").join("__pycache__").join("notes.txt"), "x");
+    let prog = projects::FindProgress::default();
+    projects::find(std::slice::from_ref(&cm), &prog);
+    let res = prog.results.into_inner();
+    let has = |p: &Path| res.iter().any(|a| a.path == p);
+    check("in-source CMake 專案不會被當成建置目錄", !has(&cm.join("my-app")));
+    check("一般 CMake build 目錄可以偵測", res.iter().any(|a| a.path == cm.join("my-lib").join("build") && a.kind.id == "cmake"));
+    check("CACHEDIR.TAG 簽章不對就不算", !has(&cm.join("fake-cache")));
+    check("CACHEDIR.TAG 簽章正確才算", has(&cm.join("real-cache")));
+    check("含 .git 的資料夾不算產物", !has(&cm.join("rsproj").join("target")));
+    check("__pycache__ 裡有其他檔案就不算", !has(&cm.join("py").join("__pycache__")));
+    check("刪除前重新確認產物", projects::revalidate(&cm.join("my-lib").join("build")).is_some() && projects::revalidate(&cm.join("my-app")).is_none());
+
+    // 8. 萬用字元
     check("萬用字元比對", rules::wildcard("thumbcache_*.db", "ThumbCache_1024.DB") && !rules::wildcard("*.exe", "a.exe.txt"));
 
     let _ = fs::remove_dir_all(&base);
@@ -271,10 +339,13 @@ fn main() {
         }
         _ => {}
     }
+    // --tab dash|clean|analyze：指定開啟的分頁（截圖用）
+    let tab = args.iter().position(|a| a == "--tab").and_then(|i| args.get(i + 1)).cloned();
     // --analyze <路徑> 或直接給路徑：啟動後馬上分析
     let analyze = match args.get(1).map(|s| s.as_str()) {
         Some("--analyze") => args.get(2).map(std::path::PathBuf::from),
         Some(p) if !p.starts_with("--") => Some(std::path::PathBuf::from(p)),
+        _ if tab.is_some() => None,
         _ => None,
     };
 
@@ -287,5 +358,14 @@ fn main() {
             .with_icon(std::sync::Arc::new(icon())),
         ..Default::default()
     };
-    let _ = eframe::run_native("DiskCleaner", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, analyze)))));
+    let _ = eframe::run_native("DiskCleaner", options, Box::new(move |cc| {
+            let mut a = app::App::new(cc, analyze);
+            match tab.as_deref() {
+                Some("clean") => a.tab = app::Tab::Clean,
+                Some("analyze") => a.tab = app::Tab::Analyze,
+                Some("dash") => a.tab = app::Tab::Dash,
+                _ => {}
+            }
+            Ok(Box::new(a))
+        }));
 }
