@@ -45,6 +45,14 @@ pub struct BootState {
     pub demo: bool,
     /// 截圖用（--demo-boot slow）：第一次畫好就捲到「拖慢開機的項目」
     pub scroll_to_slow: bool,
+    /// 截圖用（--demo-boot tasks）：捲到「排程工作」
+    pub scroll_to_tasks: bool,
+    /// 截圖用（--demo-boot plan|changes）：資料讀好就打開那個對話框
+    pub open_on_start: Option<String>,
+    /// 一鍵優化的預覽清單（打開對話框時才有）
+    pub plan: Option<Vec<crate::ui_boot::OptRow>>,
+    /// 顯示「優化記錄」對話框
+    pub show_changes: bool,
 }
 
 // ---------------------------------------------------------------------------

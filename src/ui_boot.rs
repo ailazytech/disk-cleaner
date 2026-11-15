@@ -5,6 +5,7 @@ use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Sense, Stroke
 use crate::advice::{self, Advice, Rec};
 use crate::app::{App, Tab};
 use crate::boot::{self, Action, BootLog, StartupItem};
+use crate::bootopt;
 use crate::fmt;
 use crate::theme::{self, BLUE, DIM, GREEN, ORANGE, PERI, RED, TEXT};
 
@@ -111,10 +112,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 startup_card(app, ui);
                 ui.add_space(10.0);
                 slow_card(app, ui);
+                ui.add_space(10.0);
+                tasks_card(app, ui);
+                ui.add_space(10.0);
+                services_card(app, ui);
                 ui.add_space(20.0);
             });
         });
     });
+    let ctx = ui.ctx().clone();
+    if let Some(which) = app.boot.open_on_start.take_if(|_| app.boot.data.is_some()) {
+        match which.as_str() {
+            "plan" => app.boot.plan = app.boot.data.as_ref().map(|d| build_plan(&d.items, app.elevated)),
+            _ => app.boot.show_changes = true,
+        }
+    }
+    plan_modal(app, &ctx);
+    changes_modal(app, &ctx);
 }
 
 fn header(app: &mut App, ui: &mut egui::Ui) {
@@ -366,33 +380,100 @@ fn groups(items: &[StartupItem]) -> Vec<Vec<usize>> {
     out
 }
 
+/// 目前所有延後項目的延遲秒數（決定下一個要排在多晚）
+fn existing_delays(items: &[StartupItem]) -> Vec<u32> {
+    items.iter().filter_map(|i| i.delayed.as_ref().map(|d| d.1)).collect()
+}
+
+/// 一鍵優化的一列：要處理的一組開機項目（上面清單的一列）
+#[derive(Clone, Debug)]
+pub struct OptRow {
+    pub group: Vec<usize>,
+    /// true＝延後啟動，false＝停用
+    pub delay: bool,
+    pub checked: bool,
+    pub title: String,
+    pub why: String,
+    /// 不能處理的原因（例如要系統管理員）
+    pub locked: Option<&'static str>,
+}
+
+/// 一鍵優化的候選：建議「開機不啟用」的（包含找不到程式的殘留）預設勾選；建議「延後啟用」的列出來但不預設勾選；
+/// 「保留」和「不確定」不列入。已經延後、停用或受原則管理的不列入。
+fn build_plan(items: &[StartupItem], elevated: bool) -> Vec<OptRow> {
+    let mut rows = Vec::new();
+    for g in groups(items) {
+        let it = &items[g[0]];
+        if !g.iter().any(|&i| items[i].enabled) || g.iter().any(|&i| items[i].delayed.is_some()) || it.policy {
+            continue;
+        }
+        let locked = (it.source.needs_admin() && !elevated).then_some("這一項套用在所有使用者，要系統管理員權限才能改");
+        let Some(a) = advice::for_startup(it) else { continue };
+        let delay = match a.rec {
+            Rec::Off => false,
+            Rec::Later if bootopt::launch_spec(it).is_ok() => true,
+            _ => continue,
+        };
+        let title = if g.len() > 1 { format!("{}（{} 筆相同）", it.display, g.len()) } else { it.display.clone() };
+        rows.push(OptRow { checked: !delay && locked.is_none(), group: g, delay, title, why: a.what.to_string(), locked });
+    }
+    // 先停用、再延後；各自照名稱
+    rows.sort_by(|a, b| a.delay.cmp(&b.delay).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+    rows
+}
+
 fn startup_card(app: &mut App, ui: &mut egui::Ui) {
     let elevated = app.elevated;
     let busy = app.boot.job.is_some();
     let Some(data) = &app.boot.data else { return };
     let items = data.items.clone();
+    let n_changes = data.changes.len();
     let mut gs = groups(&items);
-    let any_on = |g: &Vec<usize>| g.iter().any(|&i| items[i].enabled);
+    let any_on = |g: &Vec<usize>| g.iter().any(|&i| items[i].enabled || items[i].delayed.is_some());
     let delay = |g: &Vec<usize>| g.iter().filter_map(|&i| items[i].delay_ms).max().unwrap_or(0);
     // 會啟動的在前；有量到拖慢時間的再往前；其他照名稱
     gs.sort_by(|a, b| {
         any_on(b).cmp(&any_on(a)).then(delay(b).cmp(&delay(a))).then(items[a[0]].display.to_lowercase().cmp(&items[b[0]].display.to_lowercase()))
     });
-    let enabled = gs.iter().filter(|g| any_on(g)).count();
+    let enabled = gs.iter().filter(|g| g.iter().any(|&i| items[i].enabled)).count();
+    let delayed_n = gs.iter().filter(|g| g.iter().any(|&i| items[i].delayed.is_some())).count();
     let total = gs.len();
+    let next = bootopt::next_delay(&existing_delays(&items));
     let mut action: Option<Action> = None;
     let mut ask: Option<usize> = None;
+    let mut open_plan = false;
+    let mut open_changes = false;
     let copied: Vec<bool> = gs.iter().map(|g| is_copied(app, ui, &format!("s{}", g[0]))).collect();
     theme::glass().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             title(ui, "開機自動啟動的程式");
-            ui.label(RichText::new(format!("{enabled}／{total} 個啟用")).color(DIM));
+            let mut count = format!("{enabled}／{total} 個開機就啟動");
+            if delayed_n > 0 {
+                count += &format!("、{delayed_n} 個延後");
+            }
+            ui.label(RichText::new(count).color(DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let r = ui.add_enabled(!busy, egui::Button::new(format!("優化記錄（{n_changes}）"))).on_hover_text(
+                    "這個工具做過的停用、延後啟動、排程工作與服務的改動，可以單筆或整批還原。",
+                );
+                if r.clicked() {
+                    open_changes = true;
+                }
+                let r = ui.add_enabled(!busy, egui::Button::new(RichText::new("⚡ 一鍵優化…").color(BLUE))).on_hover_text(
+                    "先列出建議處理的項目給你勾選確認，不會直接動手。建議「開機不啟用」的預設勾選，建議「延後啟用」的要你自己勾；「保留」和「不確定」不會列入。",
+                );
+                if r.clicked() {
+                    open_plan = true;
+                }
+            });
         });
         ui.label(
-            RichText::new("取消勾選＝開機時不自動執行。只是不讓它自己啟動，程式本身不會被移除，需要時照樣可以手動打開，也隨時可以再勾回來。")
-                .small()
-                .color(DIM),
+            RichText::new(
+                "取消勾選＝開機時不自動執行；「延後」＝登入後過幾分鐘才啟動（用 Windows 的工作排程器，不裝常駐程式）。程式本身不會被移除，隨時可以改回來。",
+            )
+            .small()
+            .color(DIM),
         );
         ui.add_space(4.0);
         if items.is_empty() {
@@ -401,11 +482,14 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         for (gi, g) in gs.iter().enumerate() {
             let it = &items[g[0]];
             let on_count = g.iter().filter(|&&i| items[i].enabled).count();
+            let delayed = g.iter().find_map(|&i| items[i].delayed.clone());
             let admin_lock = it.source.needs_admin() && !elevated;
             let locked = admin_lock || it.policy || busy;
-            let mut on = on_count > 0;
+            let mut on = on_count > 0 || delayed.is_some();
             let d = delay(g);
             let mut asked = false;
+            let mut row_action: Option<Action> = None;
+            let group_items = || g.iter().map(|&i| items[i].clone()).collect::<Vec<_>>();
             let (_, _, clicked) = theme::list_row(
                 ui,
                 26.0,
@@ -418,6 +502,53 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                         theme::right_cell(ui, 100.0, "", FontId::proportional(12.5), DIM);
                     }
                     asked = ai_button(ui, copied[gi]);
+                    // 延後：已延後的是一個選單（改時間／取消），可以延後的是一個按鈕
+                    let spec = bootopt::launch_spec(it);
+                    ui.allocate_ui_with_layout(vec2(122.0, 22.0), Layout::right_to_left(Align::Center), |ui| match &delayed {
+                        Some((_, secs_now)) => {
+                            ui.add_enabled_ui(!locked, |ui| {
+                                ui.menu_button(RichText::new(format!("⏱ 登入後 {}", boot::delay_text(*secs_now))).size(12.0).color(PERI), |ui| {
+                                    for s in bootopt::DELAY_CHOICES {
+                                        let mark = if s == *secs_now { "✔ " } else { "　 " };
+                                        if ui.button(format!("{mark}登入後 {}", boot::delay_text(s))).clicked() {
+                                            row_action = Some(Action::Delay(group_items(), s));
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button("取消延後，改回開機就啟動").clicked() {
+                                        row_action = Some(Action::Undelay(group_items(), true));
+                                        ui.close();
+                                    }
+                                    if ui.button("取消延後並停用").clicked() {
+                                        row_action = Some(Action::Undelay(group_items(), false));
+                                        ui.close();
+                                    }
+                                });
+                            })
+                            .response
+                            .on_hover_text("用工作排程器在登入後才啟動它（工作排程器裡的 \\DiskCleaner\\ 資料夾）。點一下可以改時間或取消。");
+                        }
+                        None if on_count > 0 => {
+                            // 建議保留的（防毒、輸入法、驅動程式小幫手）一登入就要在，不提供延後
+                            let keep = advice::for_startup(it).is_some_and(|a| a.rec == Rec::Keep);
+                            let ok = spec.is_ok() && !locked && !keep;
+                            let r = ui.add_enabled(ok, egui::Button::new(RichText::new("延後").size(12.0)).min_size(vec2(56.0, 20.0)));
+                            let r = match &spec {
+                                Err(why) => r.on_disabled_hover_text(*why),
+                                Ok(_) if keep => r.on_disabled_hover_text("建議保留：防毒、輸入法、驅動程式小幫手這類一登入就要在，不提供延後"),
+                                Ok(_) if admin_lock => r.on_disabled_hover_text("這一項套用在所有使用者，要系統管理員權限才能改"),
+                                Ok(_) => r.on_hover_text(format!(
+                                    "改成登入後 {} 才啟動（每個延後的項目錯開 30 秒），開機時就不會跟系統搶資源。之後可以再改時間或取消。",
+                                    boot::delay_text(next)
+                                )),
+                            };
+                            if r.clicked() {
+                                row_action = Some(Action::Delay(group_items(), next));
+                            }
+                        }
+                        None => {}
+                    });
                 },
                 |ui| {
                     let r = ui.add_enabled_ui(!locked, |ui| theme::check(ui, &mut on)).inner;
@@ -435,7 +566,13 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                             format!("{name}（{} 筆中 {on_count} 筆啟用）", g.len())
                         };
                     }
-                    ui.label(RichText::new(name).color(if on_count > 0 { TEXT } else { DIM }).strong());
+                    ui.label(RichText::new(name).color(if on { TEXT } else { DIM }).strong());
+                    if delayed.is_some() && on_count > 0 {
+                        ui.label(RichText::new("會啟動兩次").small().color(RED)).on_hover_text(
+                            "它已經設成延後啟動，但原本的開機自動啟動又被打開了（例如在工作管理員重新啟用），開機時和登入後都會各啟動一次。\
+                             點右邊的延後選單取消延後，或在這裡取消勾選。",
+                        );
+                    }
                     if it.missing {
                         ui.label(RichText::new("找不到程式").small().color(RED))
                             .on_hover_text("指令指向的檔案已經不在了，通常是解除安裝後留下的殘留。確認用不到再停用。");
@@ -449,9 +586,11 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
                 },
             );
             if clicked {
-                // 一組裡只要有一筆會啟動就算「啟用」：點一下全部停用；全部停用時點一下全部啟用
-                let target = on_count == 0;
-                action = Some(Action::Toggle(g.iter().map(|&i| items[i].clone()).collect(), target));
+                // 會啟動（含延後）的點一下就停用（延後的會一併取消）；全部停用的點一下全部啟用
+                action = Some(Action::Toggle(group_items(), !(on_count > 0 || delayed.is_some())));
+            }
+            if let Some(a) = row_action {
+                action = Some(a);
             }
             if asked {
                 ask = Some(gi);
@@ -460,8 +599,8 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "這裡列出 Run 機碼、啟動資料夾和 Microsoft Store 應用程式的啟動工作。另外，工作排程器裡「登入時／開機時」執行的工作、設為自動啟動的服務，\
-                 以及「設定 → 帳戶 → 登入選項」裡「自動重新啟動我的應用程式」，也可能讓登入變慢。",
+                "這裡列出 Run 機碼、啟動資料夾和 Microsoft Store 應用程式的啟動工作。工作排程器裡「登入時／開機時」執行的工作、設為自動啟動的服務在下面；\
+                 「設定 → 帳戶 → 登入選項」裡「自動重新啟動我的應用程式」也可能讓登入變慢。",
             )
             .small()
             .color(DIM),
@@ -471,6 +610,12 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         app.boot.msg = None;
         app.start_boot_action(ui.ctx(), a);
     }
+    if open_plan {
+        app.boot.plan = Some(build_plan(&items, elevated));
+    }
+    if open_changes {
+        app.boot.show_changes = true;
+    }
     if let Some(gi) = ask
         && let Some(d) = &app.boot.data
     {
@@ -479,6 +624,313 @@ fn startup_card(app: &mut App, ui: &mut egui::Ui) {
         copy(app, ui, format!("s{}", gs[gi][0]), text);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 一鍵優化、優化記錄（對話框）
+
+fn plan_modal(app: &mut App, ctx: &egui::Context) {
+    let Some(plan) = &mut app.boot.plan else { return };
+    let Some(data) = &app.boot.data else { return };
+    let mut close = false;
+    let mut run: Option<Action> = None;
+    egui::Modal::new(egui::Id::new("boot_plan")).show(ctx, |ui| {
+        ui.set_width(720.0);
+        ui.heading("一鍵優化");
+        ui.label(
+            RichText::new("勾選要處理的項目。停用＝開機時不自動執行；延後＝登入後才啟動（從 2 分鐘起、每項錯開 30 秒）。全部都能在「優化記錄」還原。")
+                .small()
+                .color(DIM),
+        );
+        ui.add_space(6.0);
+        if plan.is_empty() {
+            ui.label(RichText::new("目前沒有建議處理的項目。").color(DIM));
+        }
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for row in plan.iter_mut() {
+                theme::list_row(
+                    ui,
+                    26.0,
+                    |ui| {
+                        let (t, c) = if row.delay { ("延後啟動", PERI) } else { ("停用", ORANGE) };
+                        theme::right_cell(ui, 80.0, t, FontId::proportional(13.0), c);
+                    },
+                    |ui| {
+                        ui.add_enabled_ui(row.locked.is_none(), |ui| theme::check(ui, &mut row.checked)).response.on_disabled_hover_text(row.locked.unwrap_or(""));
+                        ui.label(RichText::new(&row.title).color(TEXT).strong());
+                        ui.add(egui::Label::new(RichText::new(&row.why).small().color(DIM)).truncate());
+                    },
+                );
+            }
+        });
+        ui.add_space(8.0);
+        let n = plan.iter().filter(|r| r.checked && r.locked.is_none()).count();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(n > 0, egui::Button::new(RichText::new(format!("處理 {n} 項")).strong())).clicked() {
+                // 延後的時間在這時才排：已經延後的之後，依序錯開
+                let mut delays = existing_delays(&data.items);
+                let list = plan
+                    .iter()
+                    .filter(|r| r.checked && r.locked.is_none())
+                    .map(|r| {
+                        let items: Vec<StartupItem> = r.group.iter().filter_map(|&i| data.items.get(i).cloned()).collect();
+                        let d = r.delay.then(|| {
+                            let s = bootopt::next_delay(&delays);
+                            delays.push(s);
+                            s
+                        });
+                        (items, d)
+                    })
+                    .collect();
+                run = Some(Action::Optimize(list));
+                close = true;
+            }
+            if ui.button("取消").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close {
+        app.boot.plan = None;
+    }
+    if let Some(a) = run {
+        app.boot.msg = None;
+        app.start_boot_action(ctx, a);
+    }
+}
+
+fn changes_modal(app: &mut App, ctx: &egui::Context) {
+    if !app.boot.show_changes {
+        return;
+    }
+    let Some(data) = &app.boot.data else { return };
+    let elevated = app.elevated;
+    let busy = app.boot.job.is_some();
+    let mut close = false;
+    let mut run: Option<Action> = None;
+    egui::Modal::new(egui::Id::new("boot_changes")).show(ctx, |ui| {
+        ui.set_width(720.0);
+        ui.heading("優化記錄");
+        ui.label(
+            RichText::new("這個工具做過、目前還有效的改動。「還原」＝改回原本的樣子：重新啟用、刪掉延後啟動的排程工作、恢復排程工作、服務改回「自動」。")
+                .small()
+                .color(DIM),
+        );
+        ui.add_space(6.0);
+        if data.changes.is_empty() {
+            ui.label(RichText::new("沒有改動記錄。").color(DIM));
+        }
+        let needs_admin = |c: &bootopt::Change| {
+            matches!(c.kind, bootopt::ChangeKind::TaskDisabled | bootopt::ChangeKind::ServiceDelayed)
+                || matches!(c.target.as_str(), "MachineRun" | "MachineRun32" | "CommonFolder")
+        };
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (c, gone) in &data.changes {
+                theme::list_row(
+                    ui,
+                    26.0,
+                    |ui| {
+                        theme::right_cell(ui, 90.0, &fmt::ago(c.when), FontId::proportional(12.0), DIM);
+                        let lock = busy || (needs_admin(c) && !elevated);
+                        let r = ui.add_enabled(!lock, egui::Button::new(RichText::new("還原").size(12.0)).min_size(vec2(56.0, 20.0)));
+                        let r = if needs_admin(c) && !elevated { r.on_disabled_hover_text("要系統管理員權限才能還原") } else { r };
+                        if r.clicked() {
+                            run = Some(Action::Restore(vec![c.clone()]));
+                        }
+                    },
+                    |ui| {
+                        let col = match c.kind {
+                            bootopt::ChangeKind::Delayed | bootopt::ChangeKind::ServiceDelayed => PERI,
+                            _ => ORANGE,
+                        };
+                        ui.add_sized([118.0, 18.0], egui::Label::new(RichText::new(c.kind.label()).small().color(col)));
+                        ui.label(RichText::new(&c.label).color(TEXT).strong());
+                        let mut extra = String::new();
+                        if c.kind == bootopt::ChangeKind::Delayed {
+                            extra = format!("登入後 {}", boot::delay_text(c.delay));
+                        }
+                        if *gone {
+                            extra += "（延後的排程工作已經不在了，還原只會重新啟用）";
+                        }
+                        if !extra.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(extra).small().color(if *gone { ORANGE } else { DIM })).truncate());
+                        }
+                    },
+                );
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let all: Vec<bootopt::Change> = data.changes.iter().map(|(c, _)| c.clone()).filter(|c| elevated || !needs_admin(c)).collect();
+            let r = ui.add_enabled(!busy && !all.is_empty(), egui::Button::new(RichText::new(format!("全部還原（{} 項）", all.len())).strong()));
+            let r = if !elevated && all.len() < data.changes.len() { r.on_hover_text("要系統管理員權限的項目不包含在內") } else { r };
+            if r.clicked() {
+                run = Some(Action::Restore(all));
+            }
+            if ui.button("關閉").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close {
+        app.boot.show_changes = false;
+    }
+    if let Some(a) = run {
+        app.boot.msg = None;
+        app.start_boot_action(ctx, a);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 第三方排程工作、服務（系統管理員）
+
+fn tasks_card(app: &mut App, ui: &mut egui::Ui) {
+    let elevated = app.elevated;
+    let busy = app.boot.job.is_some();
+    if app.boot.scroll_to_tasks && app.boot.data.is_some() {
+        app.boot.scroll_to_tasks = false;
+        ui.scroll_to_cursor(Some(Align::TOP));
+    }
+    let Some(data) = &app.boot.data else { return };
+    let mut action: Option<Action> = None;
+    let mut relaunch = false;
+    theme::glass().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        title(ui, "開機／登入時執行的排程工作");
+        ui.label(
+            RichText::new("工作排程器裡設成「開機時」或「登入時」執行的第三方工作（多半是自動更新）。這裡只能停用或恢復，不會刪除；Microsoft 的工作不列出。")
+                .small()
+                .color(DIM),
+        );
+        ui.add_space(4.0);
+        match &data.tasks {
+            bootopt::TaskList::NeedAdmin => {
+                ui.label(RichText::new("別的程式建立的排程工作，只有系統管理員讀得到。").color(DIM));
+                if !elevated && ui.button("🛡 以系統管理員重新啟動").clicked() {
+                    relaunch = true;
+                }
+            }
+            bootopt::TaskList::Err(e) => {
+                ui.label(RichText::new(e).color(DIM));
+            }
+            bootopt::TaskList::Ok(list) if list.is_empty() => {
+                ui.label(RichText::new("沒有開機或登入時執行的第三方排程工作。").color(DIM));
+            }
+            bootopt::TaskList::Ok(list) => {
+                for t in list {
+                    let adv = advice::for_task(t);
+                    let keep = adv.is_some_and(|a| a.rec == Rec::Keep);
+                    theme::list_row(
+                        ui,
+                        26.0,
+                        |ui| {
+                            let when = match (t.boot, t.logon) {
+                                (true, true) => "開機、登入時",
+                                (true, false) => "開機時",
+                                _ => "登入時",
+                            };
+                            theme::right_cell(ui, 90.0, when, FontId::proportional(12.0), DIM);
+                            let (label, target) = if t.enabled { ("停用", false) } else { ("恢復", true) };
+                            let r = ui.add_enabled(!busy && !keep && elevated, egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(56.0, 20.0)));
+                            let r = if !elevated { r.on_disabled_hover_text("要系統管理員權限才能修改排程工作") } else if keep { r.on_disabled_hover_text("建議保留，這裡不提供停用") } else { r };
+                            if r.clicked() {
+                                action = Some(Action::TaskEnabled(t.clone(), target));
+                            }
+                        },
+                        |ui| {
+                            rec_tag(ui, adv);
+                            let name = t.path.rsplit('\\').next().unwrap_or(&t.path);
+                            let who = if t.author.is_empty() { String::new() } else { format!("\n建立者：{}", t.author) };
+                            ui.label(RichText::new(name).color(if t.enabled { TEXT } else { DIM }).strong()).on_hover_text(format!("{}{who}", t.path));
+                            if !t.enabled {
+                                ui.label(RichText::new("已停用").small().color(DIM));
+                            }
+                            let detail = format!("{} {}", t.command, t.args);
+                            ui.add(egui::Label::new(RichText::new(detail.trim()).small().color(DIM)).truncate()).on_hover_text(detail.trim());
+                        },
+                    );
+                }
+            }
+        }
+    });
+    if let Some(a) = action {
+        app.boot.msg = None;
+        app.start_boot_action(ui.ctx(), a);
+    }
+    if relaunch && crate::win::relaunch_as_admin() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+fn services_card(app: &mut App, ui: &mut egui::Ui) {
+    let elevated = app.elevated;
+    let busy = app.boot.job.is_some();
+    let Some(data) = &app.boot.data else { return };
+    let mut action: Option<Action> = None;
+    theme::glass().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        title(ui, "自動啟動的第三方服務");
+        ui.label(
+            RichText::new(
+                "設成「自動」的第三方服務會在開機時一起啟動。改成「自動（延遲開始）」是 Windows 內建的延後方式：開機完成後過一陣子才啟動，功能照常。\
+                 這裡不提供停用或改成手動；Windows 與 Microsoft 的服務不列出。",
+            )
+            .small()
+            .color(DIM),
+        );
+        ui.add_space(4.0);
+        match &data.services {
+            Err(e) => {
+                ui.label(RichText::new(e).color(DIM));
+            }
+            Ok(list) if list.is_empty() => {
+                ui.label(RichText::new("沒有設成自動啟動的第三方服務。").color(DIM));
+            }
+            Ok(list) => {
+                for s in list {
+                    let adv = advice::for_service(s);
+                    let keep = adv.is_some_and(|a| a.rec == Rec::Keep);
+                    let grouped = !s.group.is_empty();
+                    theme::list_row(
+                        ui,
+                        26.0,
+                        |ui| {
+                            theme::right_cell(ui, 70.0, if s.running { "執行中" } else { "" }, FontId::proportional(12.0), DIM);
+                            let (label, target) = if s.delayed { ("改回自動", false) } else { ("改成延遲開始", true) };
+                            let lock = busy || !elevated || keep || (grouped && target);
+                            let r = ui.add_enabled(!lock, egui::Button::new(RichText::new(label).size(12.0)).min_size(vec2(104.0, 20.0)));
+                            let r = if !elevated {
+                                r.on_disabled_hover_text("要系統管理員權限才能修改服務")
+                            } else if keep {
+                                r.on_disabled_hover_text("建議保留原本的設定（防毒、驅動相關的服務要一開機就在）")
+                            } else if grouped && target {
+                                r.on_disabled_hover_text(format!("屬於載入順序群組「{}」的服務，Windows 不允許設成延遲開始", s.group))
+                            } else {
+                                r.on_hover_text(if target { "開機完成後過一陣子才啟動（Windows 決定時間，通常 1～2 分鐘），功能照常。" } else { "改回開機就啟動。" })
+                            };
+                            if r.clicked() {
+                                action = Some(Action::ServiceDelayed(s.name.clone(), s.display.clone(), target));
+                            }
+                        },
+                        |ui| {
+                            rec_tag(ui, adv);
+                            let maker = if s.company.is_empty() { String::new() } else { format!("\n廠商：{}", s.company) };
+                            ui.label(RichText::new(&s.display).color(TEXT).strong()).on_hover_text(format!("服務名稱：{}\n{}{maker}", s.name, s.exe));
+                            if s.delayed {
+                                ui.label(RichText::new("已延遲開始").small().color(PERI));
+                            }
+                            ui.add(egui::Label::new(RichText::new(&s.exe).small().color(DIM)).truncate());
+                        },
+                    );
+                }
+            }
+        }
+    });
+    if let Some(a) = action {
+        app.boot.msg = None;
+        app.start_boot_action(ui.ctx(), a);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 

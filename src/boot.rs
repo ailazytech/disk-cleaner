@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
-use crate::win;
+use crate::{bootopt, win};
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN32: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
@@ -254,17 +254,21 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
 }
 
-fn cstr_ansi(b: &[u8], o: usize) -> Option<String> {
+/// ANSI（系統字碼頁）位元組 → 字串
+fn ansi(s: &[u8]) -> Option<String> {
     use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-    let s = b.get(o..)?;
-    let end = s.iter().position(|&c| c == 0)?;
-    let s = &s[..end];
     if s.is_empty() {
         return Some(String::new());
     }
     let mut w = vec![0u16; s.len() + 1];
     let n = unsafe { MultiByteToWideChar(CP_ACP, 0, s.as_ptr(), s.len() as i32, w.as_mut_ptr(), w.len() as i32) };
     (n > 0).then(|| String::from_utf16_lossy(&w[..n as usize]))
+}
+
+fn cstr_ansi(b: &[u8], o: usize) -> Option<String> {
+    let s = b.get(o..)?;
+    let end = s.iter().position(|&c| c == 0)?;
+    ansi(&s[..end])
 }
 
 fn cstr_utf16(b: &[u8], o: usize) -> Option<String> {
@@ -276,6 +280,11 @@ fn cstr_utf16(b: &[u8], o: usize) -> Option<String> {
 /// 捷徑（.lnk，MS-SHLLINK 格式）指向的本機檔案路徑：LinkInfo 的 LocalBasePath＋CommonPathSuffix。
 /// 只讀檔案內容，不透過 Shell 解析（不會觸發任何搜尋或網路存取）。
 fn lnk_target_bytes(d: &[u8]) -> Option<PathBuf> {
+    lnk_parse(d).map(|(t, _, _)| t)
+}
+
+/// 回傳（目標, StringData 的位置, 旗標）
+fn lnk_parse(d: &[u8]) -> Option<(PathBuf, usize, u32)> {
     if u32_at(d, 0)? != 0x4C {
         return None;
     }
@@ -309,7 +318,51 @@ fn lnk_target_bytes(d: &[u8]) -> Option<PathBuf> {
         (cstr_ansi(info, u32_at(info, 16)? as usize)?, cstr_ansi(info, u32_at(info, 24)? as usize)?)
     };
     let full = format!("{base}{suffix}");
-    (!full.is_empty()).then(|| PathBuf::from(full))
+    (!full.is_empty()).then(|| (PathBuf::from(full), li + li_size, flags))
+}
+
+/// 捷徑的目標、參數與工作目錄（延後啟動要照原樣執行）
+#[derive(Clone, Debug, PartialEq)]
+pub struct LnkInfo {
+    pub target: PathBuf,
+    pub args: String,
+    pub workdir: Option<PathBuf>,
+}
+
+/// 讀出捷徑的 StringData（名稱、相對路徑、工作目錄、參數…）。讀不完整就回傳 None，不猜。
+fn lnk_info_bytes(d: &[u8]) -> Option<LnkInfo> {
+    let (target, mut p, flags) = lnk_parse(d)?;
+    let unicode = flags & 0x80 != 0;
+    let mut read = || -> Option<String> {
+        let n = u16_at(d, p)? as usize;
+        p += 2;
+        if unicode {
+            let b = d.get(p..p + n * 2)?;
+            p += n * 2;
+            let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            Some(String::from_utf16_lossy(&u))
+        } else {
+            let b = d.get(p..p + n)?;
+            p += n;
+            ansi(b)
+        }
+    };
+    let mut workdir = None;
+    let mut args = String::new();
+    if flags & 0x04 != 0 {
+        read()?; // 名稱（說明文字）
+    }
+    if flags & 0x08 != 0 {
+        read()?; // 相對路徑
+    }
+    if flags & 0x10 != 0 {
+        let w = read()?;
+        workdir = (!w.trim().is_empty()).then(|| PathBuf::from(expand_env(w.trim())));
+    }
+    if flags & 0x20 != 0 {
+        args = expand_env(read()?.trim());
+    }
+    Some(LnkInfo { target: PathBuf::from(expand_env(&target.to_string_lossy())), args, workdir })
 }
 
 fn lnk_target(p: &Path) -> Option<PathBuf> {
@@ -318,6 +371,14 @@ fn lnk_target(p: &Path) -> Option<PathBuf> {
         return None;
     }
     lnk_target_bytes(&std::fs::read(p).ok()?)
+}
+
+pub fn lnk_details(p: &Path) -> Option<LnkInfo> {
+    let meta = std::fs::metadata(p).ok()?;
+    if meta.len() > 1 << 20 {
+        return None;
+    }
+    lnk_info_bytes(&std::fs::read(p).ok()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +408,17 @@ impl Source {
     /// 改它要不要系統管理員權限
     pub fn needs_admin(self) -> bool {
         matches!(self, Source::MachineRun | Source::MachineRun32 | Source::CommonFolder)
+    }
+    /// 寫進優化記錄的代號
+    pub fn tag(self) -> &'static str {
+        match self {
+            Source::UserRun => "UserRun",
+            Source::MachineRun => "MachineRun",
+            Source::MachineRun32 => "MachineRun32",
+            Source::UserFolder => "UserFolder",
+            Source::CommonFolder => "CommonFolder",
+            Source::StoreApp => "StoreApp",
+        }
     }
     /// 登記的位置（給「問 AI」的提問用）
     pub fn location(self) -> &'static str {
@@ -393,6 +465,8 @@ pub struct StartupItem {
     pub delay_ms: Option<u32>,
     /// 程式後面的參數（Run 機碼才有；給「問 AI」判斷要不要省略）
     pub args: String,
+    /// 已經改成延後啟動：（DiskCleaner 建立的排程工作, 延遲秒數）
+    pub delayed: Option<(String, u32)>,
 }
 
 /// StartupApproved 的值：第一個位元組是偶數（02、06）＝啟用，奇數（03、07）＝停用；沒有這個值＝啟用。
@@ -437,6 +511,7 @@ fn run_entries(root: HKEY, path: &str, source: Source, out: &mut Vec<StartupItem
             store_key: None,
             delay_ms: None,
             args,
+            delayed: None,
         });
     }
 }
@@ -478,6 +553,7 @@ fn folder_entries(dir: Option<PathBuf>, source: Source, out: &mut Vec<StartupIte
             store_key: None,
             delay_ms: None,
             args: String::new(),
+            delayed: None,
         });
     }
 }
@@ -521,6 +597,7 @@ fn store_entries(out: &mut Vec<StartupItem>) {
                 store_key: Some(task_path),
                 delay_ms: None,
                 args: String::new(),
+                delayed: None,
                 name: task,
             });
         }
@@ -962,33 +1039,131 @@ pub struct BootData {
     pub log: BootLog,
     pub items: Vec<StartupItem>,
     pub sys: SysCheck,
+    /// 優化記錄：目前和原本不一樣的地方。第二個值＝延後啟動的排程工作已經不在了（被別人刪掉）
+    pub changes: Vec<(bootopt::Change, bool)>,
+    /// 開機／登入時執行的第三方排程工作（要系統管理員才讀得到）
+    pub tasks: bootopt::TaskList,
+    /// 設成自動啟動的第三方服務
+    pub services: Result<Vec<bootopt::Service>, String>,
 }
 
 /// 在背景執行的動作
 #[derive(Clone, Debug)]
 pub enum Action {
     Reload,
-    /// 一組啟動項目全部設成啟用／停用
+    /// 一組啟動項目全部設成啟用／停用（延後中的會一併取消延後）
     Toggle(Vec<StartupItem>, bool),
     FastStartup(bool),
+    /// 一組啟動項目改成登入後延遲 N 秒啟動（已經延後的就是改延遲時間）
+    Delay(Vec<StartupItem>, u32),
+    /// 取消延後：true＝恢復成開機就啟動，false＝改成停用
+    Undelay(Vec<StartupItem>, bool),
+    /// 一鍵優化：每一組 None＝停用、Some(秒)＝延後
+    Optimize(Vec<(Vec<StartupItem>, Option<u32>)>),
+    /// 還原優化記錄裡的改動
+    Restore(Vec<bootopt::Change>),
+    /// 停用（false）或恢復（true）第三方排程工作
+    TaskEnabled(bootopt::SchedTask, bool),
+    /// 服務改成延遲開始（true）或改回自動（false）：（服務名稱, 顯示名稱, 延遲）
+    ServiceDelayed(String, String, bool),
+}
+
+/// 延遲秒數的說法，例如 150 → 2 分 30 秒
+pub fn delay_text(secs: u32) -> String {
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s} 秒"),
+        (m, 0) => format!("{m} 分鐘"),
+        (m, s) => format!("{m} 分 {s} 秒"),
+    }
 }
 
 /// 執行動作，回傳要顯示的訊息（訊息, 是不是錯誤）。之後呼叫端會重新 load()。
 pub fn run(action: Action) -> Option<(String, bool)> {
+    let first = |items: &[StartupItem]| items.first().map(|i| i.display.clone()).unwrap_or_default();
     match action {
         Action::Reload => None,
         Action::Toggle(items, on) => {
-            let name = items.first().map(|i| i.display.clone()).unwrap_or_default();
+            let name = first(&items);
+            if items.iter().any(|i| i.delayed.is_some()) {
+                return Some(match bootopt::undelay(&items, on) {
+                    Ok(()) => (format!("已取消延後並{} {name}，下次登入生效。", if on { "改回開機就啟動" } else { "停用" }), false),
+                    Err(e) => (format!("{name}：{e}"), true),
+                });
+            }
             let (ok, err) = set_enabled_many(&items, on);
-            Some(match err {
-                None => (format!("已{} {name}，下次登入生效。", if on { "啟用" } else { "停用" }), false),
-                Some(e) if ok > 0 => (format!("{name}：{} 筆中改了 {ok} 筆，其餘失敗：{e}", items.len()), true),
-                Some(e) => (format!("{name}：{e}"), true),
+            let note = bootopt::note_toggle(&items[..ok], on).err();
+            Some(match (err, note) {
+                (None, None) => (format!("已{} {name}，下次登入生效。", if on { "啟用" } else { "停用" }), false),
+                (None, Some(e)) => (format!("已{} {name}，但沒記進優化記錄：{e}", if on { "啟用" } else { "停用" }), true),
+                (Some(e), _) if ok > 0 => (format!("{name}：{} 筆中改了 {ok} 筆，其餘失敗：{e}", items.len()), true),
+                (Some(e), _) => (format!("{name}：{e}"), true),
             })
         }
         Action::FastStartup(on) => Some(match set_fast_startup(on) {
             Ok(()) => (format!("已{}快速啟動，下次關機再開機時生效。", if on { "開啟" } else { "關閉" }), false),
             Err(e) => (e, true),
+        }),
+        Action::Delay(items, secs) => {
+            let name = first(&items);
+            Some(match bootopt::delay(&items, secs) {
+                Ok(()) => (format!("{name} 改成登入後 {} 才啟動，下次登入生效。", delay_text(secs)), false),
+                Err(e) => (format!("{name}：沒有改成延後（{e}）"), true),
+            })
+        }
+        Action::Undelay(items, enable) => {
+            let name = first(&items);
+            Some(match bootopt::undelay(&items, enable) {
+                Ok(()) => (format!("已取消 {name} 的延後，{}。", if enable { "改回開機就啟動" } else { "改成停用" }), false),
+                Err(e) => (format!("{name}：{e}"), true),
+            })
+        }
+        Action::Optimize(plan) => {
+            let (mut off, mut later, mut errs) = (0, 0, Vec::new());
+            for (items, delay) in &plan {
+                let r = match delay {
+                    Some(s) => bootopt::delay(items, *s),
+                    None => {
+                        let (ok, err) = set_enabled_many(items, false);
+                        let note = bootopt::note_toggle(&items[..ok], false).err();
+                        match err.or(note) {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        }
+                    }
+                };
+                match r {
+                    Ok(()) if delay.is_some() => later += 1,
+                    Ok(()) => off += 1,
+                    Err(e) => errs.push(format!("{}：{e}", first(items))),
+                }
+            }
+            let mut m = format!("一鍵優化完成：停用 {off} 項、延後 {later} 項，下次登入生效。可以在「優化記錄」還原。");
+            if !errs.is_empty() {
+                m += &format!(" 失敗 {} 項：{}", errs.len(), errs.join("；"));
+            }
+            Some((m, !errs.is_empty()))
+        }
+        Action::Restore(list) => {
+            let now = startup_items();
+            let mut errs = Vec::new();
+            for c in &list {
+                if let Err(e) = bootopt::restore(c, &now) {
+                    errs.push(format!("{}：{e}", c.label));
+                }
+            }
+            Some(if errs.is_empty() {
+                (format!("已還原 {} 項，下次登入生效。", list.len()), false)
+            } else {
+                (format!("還原 {} 項中有 {} 項失敗：{}", list.len(), errs.len(), errs.join("；")), true)
+            })
+        }
+        Action::TaskEnabled(t, on) => Some(match bootopt::set_task_enabled(&t, on) {
+            Ok(()) => (format!("已{}排程工作 {}。", if on { "恢復" } else { "停用" }, t.path), false),
+            Err(e) => (format!("{}：{e}", t.path), true),
+        }),
+        Action::ServiceDelayed(name, label, delayed) => Some(match bootopt::set_service_delayed(&name, &label, delayed) {
+            Ok(()) => (format!("服務 {label} 已改成「{}」，下次開機生效。", if delayed { "自動（延遲開始）" } else { "自動" }), false),
+            Err(e) => (format!("{label}：{e}"), true),
         }),
     }
 }
@@ -1029,7 +1204,20 @@ pub fn load() -> BootData {
             }
         }
     }
-    BootData { log, items, sys: sys_check() }
+    // 優化記錄：延後中的項目標上它的工作與延遲；工作被別人刪掉的，記錄裡標出來（還原時只要重新啟用）
+    let mut changes = Vec::new();
+    for c in bootopt::log_load_from(&bootopt::log_path()) {
+        let gone = c.kind == bootopt::ChangeKind::Delayed && !bootopt::task_exists(&c.task);
+        if c.kind == bootopt::ChangeKind::Delayed && !gone {
+            for it in items.iter_mut().filter(|it| c.is_item(it)) {
+                it.delayed = Some((c.task.clone(), c.delay));
+            }
+        }
+        changes.push((c, gone));
+    }
+    // 別人的排程工作定義只有系統管理員讀得到；一般權限讀到的資料夾是空的，不能當成「沒有」
+    let tasks = if win::is_elevated() { bootopt::sched_tasks() } else { bootopt::TaskList::NeedAdmin };
+    BootData { log, items, sys: sys_check(), changes, tasks, services: bootopt::services() }
 }
 
 /// 示範資料（`--demo-boot`，截圖、看版面用）：全部是假的，不讀也不改系統。
@@ -1058,6 +1246,7 @@ pub fn demo() -> BootData {
         store_key: None,
         delay_ms: None,
         args: String::new(),
+        delayed: None,
     };
     let steam = r"C:\Program Files (x86)\Steam\steam.exe";
     let mut items = vec![
@@ -1106,7 +1295,84 @@ pub fn demo() -> BootData {
         sys_ssd: Some(true),
         os: "Windows 10 Pro 22H2（組建 19045）".into(),
     };
-    BootData { log: BootLog::Ok { boots, slow, note: None }, items, sys }
+    // OneDrive 示範成已延後；優化記錄裡有它和一個停用的項目、一個停用的排程工作
+    items[1].enabled = false;
+    items[1].delayed = Some((r"\DiskCleaner\延後啟動 OneDrive (0d1e2f3a)".into(), 120));
+    let ch = |kind, label: &str, target: &str, name: &str, command: &str, task: &str, delay| bootopt::Change {
+        kind,
+        when: now - day,
+        label: label.into(),
+        target: target.into(),
+        name: name.into(),
+        command: command.into(),
+        store_key: String::new(),
+        task: task.into(),
+        delay,
+    };
+    let changes = vec![
+        (ch(bootopt::ChangeKind::Delayed, "OneDrive", "UserRun", "OneDrive", &items[1].command, r"\DiskCleaner\延後啟動 OneDrive (0d1e2f3a)", 120), false),
+        (ch(bootopt::ChangeKind::Disabled, "Edge 開機預先載入", "UserRun", "MicrosoftEdgeAutoLaunch_0", "msedge.exe", "", 0), false),
+        (ch(bootopt::ChangeKind::TaskDisabled, "AdobeAAMUpdater-1.0", r"\AdobeAAMUpdater-1.0", "", "", "", 0), false),
+    ];
+    let task = |path: &str, enabled, logon, boot, command: &str| bootopt::SchedTask {
+        path: path.into(),
+        enabled,
+        logon,
+        boot,
+        command: command.into(),
+        args: String::new(),
+        author: String::new(),
+    };
+    let tasks = bootopt::TaskList::Ok(vec![
+        task(r"\AdobeAAMUpdater-1.0", false, true, false, r"C:\Program Files (x86)\Common Files\Adobe\OOBE\PDApp\UWA\UpdaterStartupUtility.exe"),
+        task(r"\GoogleUpdateTaskMachineCore", true, true, false, r"C:\Program Files (x86)\Google\Update\GoogleUpdate.exe"),
+        task(r"\Demo\Backup at logon", true, true, true, r"C:\Program Files\Demo Backup\backup.exe"),
+    ]);
+    let svc = |name: &str, display: &str, exe: &str, delayed, running| bootopt::Service {
+        name: name.into(),
+        display: display.into(),
+        exe: exe.into(),
+        company: String::new(),
+        delayed,
+        running,
+        group: String::new(),
+    };
+    let services = Ok(vec![
+        svc("DemoSync", "Demo Sync Service", r"C:\Program Files\Demo\demosync.exe", false, true),
+        svc("McAfeeFramework", "McAfee Framework Host", r"C:\Program Files\McAfee\Framework\mc-fw-host.exe", false, true),
+        svc("gupdate", "Google Update Service", r"C:\Program Files (x86)\Google\Update\GoogleUpdate.exe", true, false),
+    ]);
+    BootData { log: BootLog::Ok { boots, slow, note: None }, items, sys, changes, tasks, services }
+}
+
+/// 自我測試用：在目前使用者的 Run 機碼放一個名稱唯一的測試值。remove() 只刪自己建立的值（含 StartupApproved），
+/// 並確認真的刪掉了。
+pub struct TestRunValue {
+    name: String,
+}
+
+impl TestRunValue {
+    pub fn create(name: &str, command: &str) -> Option<TestRunValue> {
+        let approved = format!(r"{APPROVED}\Run");
+        let exists = |path: &str| open_key(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE).and_then(|k| query(&k, name)).is_some();
+        if exists(RUN) || exists(&approved) {
+            return None;
+        }
+        let data: Vec<u8> = command.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect();
+        write_value(HKEY_CURRENT_USER, RUN, name, REG_SZ, &data).ok()?;
+        Some(TestRunValue { name: name.into() })
+    }
+
+    pub fn remove(self) -> bool {
+        let approved = format!(r"{APPROVED}\Run");
+        let exists = |path: &str| open_key(HKEY_CURRENT_USER, path, KEY_QUERY_VALUE).and_then(|k| query(&k, &self.name)).is_some();
+        let del = |path: &str| {
+            let p = win::wide(path);
+            let n = win::wide(&self.name);
+            !exists(path) || unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, p.as_ptr(), n.as_ptr()) == 0 }
+        };
+        del(RUN) && del(&approved) && !exists(RUN) && !exists(&approved)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1425,19 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         ("啟動項目：宿主程式不對應到單一項目", is_host(Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")) && is_host(Path::new(r"C:\Python312\python3.12.exe")) && !is_host(Path::new(r"C:\Apps\steam.exe"))),
         ("啟動項目：解析捷徑目標", lnk_target_bytes(&lnk) == Some(PathBuf::from(r"C:\Apps\Tool\tool.exe"))),
         ("啟動項目：壞掉的捷徑不會當掉", lnk_target_bytes(&lnk[..0x50]).is_none()),
+        ("啟動項目：讀出捷徑的參數與工作目錄", {
+            // 同一個捷徑加上 Unicode 的 StringData：工作目錄、參數
+            let mut l2 = lnk.clone();
+            l2[0x14] |= 0x10 | 0x20 | 0x80;
+            for s in [r"C:\Apps\Tool", "--tray --x"] {
+                let u: Vec<u16> = s.encode_utf16().collect();
+                l2.extend((u.len() as u16).to_le_bytes());
+                l2.extend(u.iter().flat_map(|c| c.to_le_bytes()));
+            }
+            lnk_info_bytes(&l2)
+                == Some(LnkInfo { target: PathBuf::from(r"C:\Apps\Tool\tool.exe"), args: "--tray --x".into(), workdir: Some(PathBuf::from(r"C:\Apps\Tool")) })
+                && lnk_info_bytes(&l2[..l2.len() - 4]).is_none()
+        }),
         ("啟動項目：Store 應用程式名稱", store_display("5319275A.WhatsAppDesktop_cv1g1gvanyjgm", "x") == "WhatsAppDesktop" && store_display("Microsoft.549981C3F5F10_8wekyb3d8bbwe", "CortanaStartupId") == "Cortana"),
     ]
     .into_iter()

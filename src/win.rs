@@ -337,6 +337,78 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// 目前使用者的 SID 字串（S-1-5-21-…），建立「只在自己登入時執行」的排程工作要用。
+pub fn current_user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut need = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut need);
+        // 用 u64 對齊的緩衝區，TOKEN_USER 裡有指標
+        let mut buf = vec![0u64; (need as usize).div_ceil(8).max(1)];
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32, &mut need);
+        CloseHandle(token);
+        if ok == 0 {
+            return None;
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(tu.User.Sid, &mut s) == 0 || s.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        while *s.add(len) != 0 {
+            len += 1;
+        }
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, len));
+        LocalFree(s as *mut _);
+        Some(out)
+    }
+}
+
+/// 執行檔版本資訊裡的公司名稱（CompanyName）；讀不到回傳空字串。
+pub fn file_company(path: &Path) -> String {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+    let w = wide(path);
+    unsafe {
+        let size = GetFileVersionInfoSizeW(w.as_ptr(), std::ptr::null_mut());
+        if size == 0 || size > 16 << 20 {
+            return String::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) == 0 {
+            return String::new();
+        }
+        // 先看版本資訊宣告了哪些語言／字碼頁，沒有就試常見的英文
+        let mut langs: Vec<(u16, u16)> = Vec::new();
+        let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut n = 0u32;
+        let key = wide(r"\VarFileInfo\Translation");
+        if VerQueryValueW(buf.as_ptr() as *const _, key.as_ptr(), &mut p, &mut n) != 0 && !p.is_null() {
+            let pairs = std::slice::from_raw_parts(p as *const u16, (n as usize / 2).min(64));
+            langs.extend(pairs.chunks_exact(2).map(|c| (c[0], c[1])));
+        }
+        langs.extend([(0x0409, 0x04B0), (0x0409, 0x04E4), (0x0000, 0x04B0)]);
+        for (lang, cp) in langs {
+            let key = wide(format!(r"\StringFileInfo\{lang:04x}{cp:04x}\CompanyName"));
+            let mut v: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            if VerQueryValueW(buf.as_ptr() as *const _, key.as_ptr(), &mut v, &mut len) != 0 && !v.is_null() && len > 0 {
+                let s = std::slice::from_raw_parts(v as *const u16, len as usize);
+                let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+                return String::from_utf16_lossy(&s[..end]).trim().to_string();
+            }
+        }
+        String::new()
+    }
+}
+
 /// 以系統管理員身分重新啟動自己。成功回傳 true（呼叫端應結束程式）。
 pub fn relaunch_as_admin() -> bool {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;

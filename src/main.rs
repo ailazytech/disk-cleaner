@@ -4,6 +4,7 @@ mod advice;
 mod anim;
 mod app;
 mod boot;
+mod bootopt;
 mod cache;
 mod cleaner;
 mod fmt;
@@ -411,6 +412,12 @@ fn selftest() -> bool {
     for (name, cond) in advice::selftest() {
         check(name, cond);
     }
+    for (name, cond) in bootopt::selftest(&base) {
+        check(name, cond);
+    }
+    for (name, cond) in bootopt::delay_roundtrip(&base) {
+        check(name, cond);
+    }
 
     // 10. 第二輪審查（Codex gpt-6.1-sol）
     // 10a. 握住的資料夾與它的上層都不能被改名（刪除途中不能被換成 junction）
@@ -680,6 +687,8 @@ fn main() {
                 a.tab = app::Tab::Boot;
                 a.boot.demo = true;
                 a.boot.scroll_to_slow = args.iter().any(|x| x == "slow");
+                a.boot.scroll_to_tasks = args.iter().any(|x| x == "tasks");
+                a.boot.open_on_start = args.iter().find(|x| *x == "plan" || *x == "changes").cloned();
             }
             Ok(Box::new(a))
         }));

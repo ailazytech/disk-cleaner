@@ -371,6 +371,40 @@ pub fn for_slow(s: &SlowItem) -> Option<Advice> {
     }
 }
 
+fn is_updater(s: &str) -> bool {
+    let l = s.to_lowercase();
+    l.contains("update") || l.contains("updater")
+}
+
+/// 開機／登入時執行的第三方排程工作。這裡只能停用；防毒、驅動這類「保留」的不給停。
+pub fn for_task(t: &crate::bootopt::SchedTask) -> Option<Advice> {
+    let file = file_of(Path::new(&t.command));
+    let name = t.path.rsplit('\\').next().unwrap_or(&t.path);
+    lookup(&file, name, &scrub(&t.command)).or_else(|| {
+        (is_updater(name) || is_updater(&file)).then_some(a(
+            Rec::Off,
+            "自動更新工作",
+            "只是在開機或登入時檢查更新。停用後不會自動更新，記得偶爾打開程式手動更新；瀏覽器和防毒的更新建議保留。",
+        ))
+    })
+}
+
+/// 設成「自動」的第三方服務。這裡唯一的動作是改成「自動（延遲開始）」，所以除了「保留」之外都標成「延後啟用」。
+pub fn for_service(s: &crate::bootopt::Service) -> Option<Advice> {
+    let file = file_of(Path::new(&s.exe));
+    let found = lookup(&file, &format!("{}\n{}", s.display, s.name), &scrub(&s.exe));
+    match found {
+        Some(x) if x.rec == Rec::Keep => Some(x),
+        Some(x) => Some(Advice { rec: Rec::Later, what: x.what, how: "可以改成「自動（延遲開始）」：開機完成後過一陣子才啟動，功能照常。" }),
+        None if is_updater(&s.display) || is_updater(&s.name) || is_updater(&file) => Some(a(
+            Rec::Later,
+            "自動更新服務",
+            "可以改成「自動（延遲開始）」：開機完成後過一陣子才啟動，更新照常。",
+        )),
+        None => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 遮掉個人資料
 
@@ -840,6 +874,7 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         store_key: None,
         delay_ms: Some(127_100),
         args: "--hidden --token SECRET123".into(),
+        delayed: None,
     };
     let si = SlowItem {
         kind: "程式",
@@ -856,7 +891,7 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
     };
     let boot = BootRecord { when: now - 190 * day, total_ms: 88_500, main_ms: 56_600, post_ms: 31_900, degraded: true };
     let sys = SysCheck { fast_startup: Some(true), hibernate: Some(true), sys_drive: "C:".into(), sys_free: 1, sys_total: 4, sys_ssd: Some(true), os: "Windows 10".into() };
-    let data = BootData { log: BootLog::Ok { boots: vec![boot], slow: vec![si.clone()], note: None }, items: vec![it], sys };
+    let data = BootData { log: BootLog::Ok { boots: vec![boot], slow: vec![si.clone()], note: None }, items: vec![it], sys, changes: Vec::new(), tasks: crate::bootopt::TaskList::NeedAdmin, services: Ok(Vec::new()) };
     let report = full_report(&data);
     let one = slow_prompt(&si, &data.items, "Windows 10");
     let start = startup_prompt(&data.items.iter().collect::<Vec<_>>(), "Windows 10");

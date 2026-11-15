@@ -70,6 +70,10 @@ Models are never pre-selected.
 - Programs that start automatically (Run keys, Startup folders with shortcut targets resolved, and Microsoft Store app startup tasks): turn them off or on the same way Task Manager's Startup tab does. Nothing is uninstalled or deleted, entries whose program is gone are flagged, and identical entries (Edge often registers dozens) are grouped
 - Checks for Fast Startup, free space on the system drive, and whether Windows is on an SSD
 - A suggestion tag on every startup program and slow-boot item: *don't start at boot*, *start later* or *keep* (security software, drivers, input methods, VPNs and password managers). Hover for what it is and how to handle it; anything not recognized is marked *not sure*. Slow-boot items that are also startup programs can be turned off right there
+- *Delay*: a startup program can start a few minutes after you sign in instead of at boot. DiskCleaner creates a Task Scheduler task in the `\DiskCleaner\` folder (sign-in trigger with a delay, your account, normal rights) and only then turns off the original entry; the first one waits 2 minutes and each next one 30 seconds more, and the delay can be changed per item. No background service is installed, and Task Manager and Task Scheduler show exactly what was done
+- *One-click optimize*: a preview of the suggested changes (programs marked *don't start at boot* and leftovers are ticked; *start later* ones only if you tick them; *keep* and *not sure* are never included)
+- *Change log*: every change made here (disable, delay, scheduled task, service) is recorded and can be undone one by one or all at once
+- As administrator: third-party scheduled tasks that run at boot or sign-in (disable or re-enable only, never delete) and third-party services set to Automatic (switch to Automatic (Delayed Start) and back). Windows and Microsoft tasks and services are not listed
 - *Ask AI*: copies a ready-made question about one item, or a full report of the page, for ChatGPT, Claude or Gemini. Your user folder is replaced with `%USERPROFILE%`, other user names and e-mail addresses are masked, and command-line arguments keep only their switch names. Nothing is sent anywhere; it only goes to the clipboard, so glance over it before pasting
 
 Reading the boot log needs administrator rights. Windows does not write this log on every boot, so the page says when the newest record is old.
@@ -101,7 +105,7 @@ Wrongly deleting your data is the worst thing a cleaner can do, so the deletion 
 - Files in use are skipped; cloud placeholders (OneDrive) are never deleted; with an age limit, recently created folders are kept; files with other hard links don't count as freed space
 - **Move to Recycle Bin** goes through the same checks as permanent delete (including cloud files anywhere inside a folder) and asks before permanently deleting something that can't be recycled; the analyzer refuses to delete stale cached data, or anything created or modified after the scan, until you rescan
 - Clean rules delete permanently (that is how space gets freed)
-- `disk-cleaner.exe --selftest` runs 122 checks in a scratch folder (a reversible startup-entry registry round trip, junctions, a folder turned into a junction in place mid-clean, folders held open against renaming, 8.3 short names, hard links, simulated cloud files, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
+- `disk-cleaner.exe --selftest` runs 133 checks in a scratch folder (a reversible startup-entry registry round trip, junctions, a folder turned into a junction in place mid-clean, folders held open against renaming, 8.3 short names, hard links, simulated cloud files, read-only files, protected-path aliases, fake projects, a fake Ollama store with malicious and half-written manifests, look-alike model files, synthetic MFT records…); CI runs it on every push
 
 The deletion code was reviewed by two independent AI reviewers (OpenAI Codex and Google Gemini) before release, and the fixes went through two more review rounds; the issues found are fixed and covered by the self-test.
 
@@ -137,6 +141,7 @@ DiskCleaner makes no network requests. Everything it keeps lives in `%LOCALAPPDA
 
 - `cache\*.idx` — scan indexes (you can clear them from the analyzer start page)
 - `rules.cache`, `projects.cache` — the last results of the clean page
+- `boot_changes.txt` — the boot speed-up change log (what to undo)
 - `settings.txt` — your search folders
 
 ## Source layout
@@ -155,6 +160,7 @@ DiskCleaner makes no network requests. Everything it keeps lives in `%LOCALAPPDA
 | `src/suggest.rs`, `src/summary.rs` | Suggested-cleanup logic; per-drive space summaries |
 | `src/boot.rs`, `src/ui_boot.rs` | Boot speed-up: boot log, startup programs, system checks |
 | `src/advice.rs` | Boot suggestions (don't start / start later / keep) and the "Ask AI" questions |
+| `src/bootopt.rs` | Delayed start via Task Scheduler, scheduled tasks and services, change log and undo |
 | `src/anim.rs` | Trash-bin animation in the clean progress window |
 | `examples/gen_icon.rs` | Generates `assets/icon.ico` (`cargo run --example gen_icon`) |
 | `tools/` | Screenshot / click helpers and the elevated MFT benchmark |
